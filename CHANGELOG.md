@@ -2,6 +2,20 @@
 
 What changed in each fctl release, from its Conventional Commits (`cargo xtask release` writes this file).
 
+## 0.39.0 (2026-11-26)
+
+### Features
+
+- Run Codex on ChatGPT subscriptions ([#2](https://github.com/design4pro/fctl/pull/2))
+
+### Fixes
+
+- **host:** Run Apple network probes under init ([#3](https://github.com/design4pro/fctl/pull/3))
+
+### Other changes
+
+- Add acme instance configuration ([e091aa6](https://github.com/design4pro/fctl/commit/e091aa6d9c5c5af3ba135df3ae420f90382ab15f))
+
 ## 0.38.1 (2026-11-25)
 
 ### Features
