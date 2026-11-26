@@ -21,8 +21,8 @@ use std::io::IsTerminal;
 #[command(
     name = "fctl",
     version,
-    about = "A software factory: start Claude agents, follow them, and run their sessions on your machines",
-    long_about = "fctl starts Claude Code agents on your projects, streams what they do, and lets you message them. \
+    about = "A software factory: start Claude and Codex agents, follow them, and run their sessions on your machines",
+    long_about = "fctl starts coding agents on your projects, streams what they do, and lets you message them. \
                   Sessions run on runners, machines with the `fctl host` service on them: \
                   `fctl host` turns this machine into one, and `fctl runners` manages them from anywhere.",
     after_help = "Examples:
@@ -46,7 +46,7 @@ struct Cli {
     json: bool,
     /// Act for this person, by their id (usr_…) or one of their addresses:
     /// with a service account's token (fctl_svc_…), whose sessions are
-    /// then theirs, on their Claude subscription.
+    /// then theirs, on their subscription.
     #[arg(
         long,
         global = true,
@@ -216,7 +216,7 @@ Examples:
   fctl review submit review.json       # a review agent, in its sandbox")]
     Review(cmd::review::ReviewArgs),
     /// Schedules: tasks fctl starts a session for on its own, once at a set
-    /// time or again and again, on the Claude subscription of the person
+    /// time or again and again, on the subscription of the person
     /// each runs for. Run one now, or from another tool with an access
     /// token.
     #[command(
@@ -311,7 +311,7 @@ Examples:
   fctl diff --json my-app#12 | jq -r '.files[].path'")]
     Diff(cmd::sessions::DiffArgs),
     /// Send a message to a session's agent. A stopped session resumes for
-    /// it, on the Claude subscription it ran on.
+    /// it, on the subscription it ran on.
     Send {
         /// A session: its id (ses_…), its URL, or project#number.
         session: String,
@@ -348,7 +348,7 @@ Examples:
         /// A session: its id (ses_…), its URL, or project#number.
         session: String,
     },
-    /// Resume a stopped or failed session on your Claude subscription,
+    /// Resume a stopped or failed session, or a paused Codex session,
     /// optionally with a new message.
     Resume {
         /// A session: its id (ses_…), its URL, or project#number.
@@ -359,13 +359,13 @@ Examples:
         #[arg(short, long = "attach", value_name = "FILE")]
         attach: Vec<std::path::PathBuf>,
     },
-    /// Continue a session on your Claude subscription: one that waits for
+    /// Continue a session on your subscription: one that waits for
     /// its subscription's limit to reset, or for a message, starts again
     /// on yours, and a stopped one resumes on it. Messages keep a session
     /// on the subscription it ran on.
     #[command(
         name = "take-over",
-        after_help = "It runs on the Claude connection you chose for its workspace (Settings → Claude), which may be another of your own.
+        after_help = "It runs on the connection you chose for its workspace in Settings → Claude or Settings → Codex.
 
 Examples:
   fctl take-over my-app#12"
@@ -427,6 +427,9 @@ Examples:
     /// Connect your Claude subscription.
     #[command(subcommand)]
     Claude(cmd::claude::ClaudeCmd),
+    /// Manage the ChatGPT connections Codex sessions run on.
+    #[command(subcommand)]
+    Codex(cmd::codex::CodexCmd),
     /// Choose what notifies you, and see the browsers that show it.
     #[command(subcommand)]
     Notifications(cmd::notifications::NotificationsCmd),
@@ -645,6 +648,7 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
             cmd::sessions::open(server, target.as_deref(), claude).await
         }
         Command::Claude(c) => cmd::claude::run(server, c, json).await,
+        Command::Codex(c) => cmd::codex::run(server, c, json).await,
         Command::Notifications(c) => cmd::notifications::run(server, c, json).await,
         Command::Host(c) => cmd::host::run(server, c, json).await,
         Command::Runners {

@@ -597,6 +597,18 @@ pub fn effort(input: &str) -> Result<String> {
     }
 }
 
+/// A reasoning effort accepted by Codex App Server.
+pub fn codex_effort(input: &str) -> Result<String> {
+    let effort = input.trim().to_ascii_lowercase();
+    match effort.as_str() {
+        "none" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max" => Ok(effort),
+        _ => Err(ApiError::validation(
+            "effort",
+            "Use none, minimal, low, medium, high, xhigh or max",
+        )),
+    }
+}
+
 /// An OCI image reference.
 pub fn image(input: &str) -> Result<String> {
     let s = input.trim();

@@ -29,6 +29,7 @@ import {
   Users,
 } from "lucide-react";
 import { type RefObject, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
+import { ManageChatGptUsage } from "@/components/codex/plan";
 import { GithubAccessChip, GithubAccessLabel } from "@/components/github-access";
 import { useAutopilot } from "@/components/project/autopilot";
 import { ReviewFacts, ReviewFooter, useSessionReview } from "@/components/review";
@@ -108,6 +109,7 @@ import { ago, duration, num, stamp, when } from "@/lib/format";
 import { blobLink, branchOf, hasChanges, repoChanges } from "@/lib/git";
 import { onGithub, sessionGithub } from "@/lib/github-access";
 import { useLiveSession } from "@/lib/live";
+import { planName } from "@/lib/models";
 import { nowOf, waitingOf } from "@/lib/now";
 import { planOf } from "@/lib/plan";
 import {
@@ -121,14 +123,14 @@ import {
   prTitle,
   pullRequests,
 } from "@/lib/pulls";
-import { keys, queryClient, useMe, useProject } from "@/lib/queries";
+import { keys, queryClient, useCodexSettings, useMe, useProject } from "@/lib/queries";
 import { claudeAppLink, remoteControlUrl, remoteControlUser } from "@/lib/remote-control";
 import { parts } from "@/lib/runs";
 import { ariaShortcut, useShortcut, withShortcut } from "@/lib/shortcuts";
 import { type DiskShort, diskOf, diskText, type Stall, stallText, useStall } from "@/lib/stall";
 import { besidePill, type StatusNote, statusNotes, waitsForYou } from "@/lib/status";
 import { useStickToBottom } from "@/lib/stick-to-bottom";
-import { takeOverOf } from "@/lib/subscription";
+import { chosenCodexConnection, takeOverOf } from "@/lib/subscription";
 import type { Item } from "@/lib/transcript";
 import { factsOf, type Turn, type TurnFacts, turnOfSeq, turnSeq, turnsOf, turnTitle } from "@/lib/turns";
 import { cameAfter, newestSeq } from "@/lib/unseen";
@@ -154,6 +156,8 @@ export function SessionPage() {
   const initial = useQuery({ queryKey: keys.session(id), queryFn: () => api.session(id) });
   const [s, store] = useLiveSession(id, initial.data);
   const session = s.session ?? initial.data;
+  const codex = session?.agent_kind === "codex";
+  const codexSettings = useCodexSettings(codex).data;
   // The snapshot its sandbox saves as it stops comes only with its details: read them again then.
   const stopped = session?.status === "stopped";
   useEffect(() => {
@@ -380,11 +384,14 @@ export function SessionPage() {
   // The session's workspace as your list has it now (renames and avatars).
   const workspace = freshest(workspaceIndex, session?.workspace ?? initial.data?.workspace);
   // Only the person on whose Claude subscription it runs can follow it in the Claude apps.
-  const claudeUrl = session && remoteControlUrl(session.remote_control, session.created_by, me?.user.id);
+  const claudeUrl =
+    !codex && session ? remoteControlUrl(session.remote_control, session.created_by, me?.user.id) : undefined;
   const role = s.role ?? session?.role;
   const isOwner = role === "owner";
   // Whether you may move it to your Claude subscription now.
+  const connection = chosenCodexConnection(codexSettings, workspace?.id);
   const takeOver = takeOverOf(session, role, me, {
+    codexActive: !!connection?.connected && connection.plan_enabled && !connection.paused,
     // Only the session's own request says which of your connections it runs on.
     mine: initial.data?.claude_connection,
     chosen: workspace?.id ? workspaceIndex.get(workspace.id)?.claude : undefined,
@@ -685,18 +692,20 @@ export function SessionPage() {
                           {session?.review ? "Stop the review" : "Stop the session"}
                         </MenuItem>
                       )}
-                      {isOwner && !session?.review && (status === "stopped" || status === "failed") && (
-                        <MenuItem
-                          icon={<Play />}
-                          onClick={() => {
-                            close();
-                            // The message box says so itself when it resumes the session.
-                            resume.mutate(undefined, { onError: (e) => toast(e.message, "error") });
-                          }}
-                        >
-                          Resume
-                        </MenuItem>
-                      )}
+                      {isOwner &&
+                        !session?.review &&
+                        (status === "stopped" || status === "failed" || (codex && status === "paused")) && (
+                          <MenuItem
+                            icon={<Play />}
+                            onClick={() => {
+                              close();
+                              // The message box says so itself when it resumes the session.
+                              resume.mutate(undefined, { onError: (e) => toast(e.message, "error") });
+                            }}
+                          >
+                            Resume
+                          </MenuItem>
+                        )}
                       {takeOver && (
                         <MenuItem
                           icon={<ArrowRightLeft />}
@@ -918,9 +927,10 @@ export function SessionPage() {
                   onTyping={() => store.typing()}
                   onTakeOver={takeOver?.waits ? () => setMoving(true) : undefined}
                   limitOf={takeOver?.whose}
+                  agent={session?.agent_kind}
                   movedOn={movedOn}
                   choices={
-                    isOwner && session ? (
+                    isOwner && session && !codex ? (
                       <SessionChoices session={session} perTurnEffort={s.perTurnEffort} />
                     ) : undefined
                   }
@@ -1078,7 +1088,7 @@ function Cover({
             <span className="truncate">
               {session.review ? "On " : "Started by "}
               <span className="text-ink-2">{session.created_by.name}</span>
-              {session.review && "'s Claude subscription"}
+              {session.review && `'s ${planName(session.agent_kind)}`}
               {/* A program of the workspace's started it for them: which, and that it's theirs. */}
               {!session.review && session.service_account && <ServiceAccountStarter session={session} />}
             </span>
@@ -1601,6 +1611,9 @@ function Details({
   snapshot?: G.SessionSnapshot;
 }) {
   const st = session.stats;
+  const codex = session.agent_kind === "codex";
+  const billedTo = codex ? session.codex : session.claude;
+  const planLabel = planName(session.agent_kind);
   const project = useProject(session.project_slug).data;
   const retrospectives = useRetrospectives(session, items);
   const memory = useSessionMemory(session, project);
@@ -1620,7 +1633,7 @@ function Details({
   const claudeUrl = remoteControlUrl(rc, session.created_by, me);
   const rcUser = remoteControlUser(rc, session.created_by);
   // The Claude apps show it only to the person on whose subscription it runs.
-  const claudeApps = claudeUrl ? (
+  const claudeApps = codex ? null : claudeUrl ? (
     <>
       <a
         {...claudeAppLink(claudeUrl)}
@@ -1720,7 +1733,7 @@ function Details({
         <Row k="Agent time" v={<AgentTime stats={st} until={stall?.since} />} />
         <Row k="Tokens in / out" v={`${num(st.input_tokens)} / ${num(st.output_tokens)}`} />
         <Row k="Cache reads" v={num(st.cache_read_tokens)} />
-        <ContextMeter session={session} />
+        {!codex && <ContextMeter session={session} />}
       </RailSection>
       <RailSection title="Session">
         <Row
@@ -1728,7 +1741,7 @@ function Details({
           v={
             <span
               className="inline-flex items-center gap-1.5"
-              title={session.review ? `${session.created_by.name}'s Claude subscription` : undefined}
+              title={session.review ? `${session.created_by.name}'s ${planLabel}` : undefined}
             >
               <Avatar user={session.created_by} size={16} />
               {session.created_by.name}
@@ -1781,11 +1794,14 @@ function Details({
         <Row
           k="Billing"
           v={
-            session.claude
-              ? session.claude.id === me
-                ? "Your Claude subscription"
-                : `${session.claude.name}'s Claude subscription`
-              : "Claude subscription"
+            <span className="inline-flex flex-wrap justify-end gap-x-2">
+              {billedTo
+                ? billedTo.id === me
+                  ? `Your ${planLabel}`
+                  : `${billedTo.name}'s ${planLabel}`
+                : planLabel}
+              {codex && billedTo?.id === me && <ManageChatGptUsage />}
+            </span>
           }
         />
       </RailSection>

@@ -14,6 +14,7 @@ services:
     environment:
       FCTL_PUBLIC_URL: ${FCTL_PUBLIC_URL:-http://localhost:8787}
       FCTL_INSTANCE_NAME: ${FCTL_INSTANCE_NAME:-fctl}
+      FCTL_CODEX_ENABLED: ${FCTL_CODEX_ENABLED:-0}
     volumes:
       # The database, the sessions' event logs, attachments and the master key.
       - fctl-data:/data

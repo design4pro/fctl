@@ -28,6 +28,7 @@ export interface DraftText {
   project?: string;
   /** Where the caret was, or what was selected. */
   selection?: [number, number];
+  agent_kind?: G.AgentKind;
   /** The model and effort level picked for it ("" is Claude's default). */
   model?: string;
   effort?: string;
@@ -46,7 +47,7 @@ export function loadText(draft: string): DraftText | undefined {
   try {
     const d: unknown = JSON.parse(localStorage.getItem(TEXT + draft) ?? "null");
     if (!d || typeof d !== "object" || !("prompt" in d) || typeof d.prompt !== "string") return undefined;
-    const { project, model, effort, github } = d as Record<string, unknown>;
+    const { project, agent_kind, model, effort, github } = d as Record<string, unknown>;
     const text = (v: unknown) => (typeof v === "string" ? v : undefined);
     const s = "selection" in d && Array.isArray(d.selection) ? d.selection : [];
     const selection =
@@ -56,6 +57,7 @@ export function loadText(draft: string): DraftText | undefined {
       prompt: d.prompt,
       project: text(project),
       selection,
+      ...(agent_kind === "claude" || agent_kind === "codex" ? { agent_kind } : {}),
       model: text(model),
       effort: text(effort),
       github: access,

@@ -1,10 +1,11 @@
 //! `fctl schedules`: a project's schedules, tasks fctl starts a session
 //! for on its own, once at a set time, again and again, or each time
-//! something happens on GitHub, on the Claude subscription of the person
+//! something happens on GitHub, on the subscription of the person
 //! each runs for. People set them up, change, pause and delete them, and
 //! run one now; other tools run one with an access token (`fctl schedules
 //! run`, with what they know of why).
 
+use super::codex::{AgentArg, require_supported, subscription};
 use crate::config;
 use crate::style;
 use anyhow::{Context, Result, bail};
@@ -162,12 +163,13 @@ fn event_by(s: &str) -> Result<ScheduleEventBy> {
 /// What a schedule's sessions start with.
 #[derive(Args, Default)]
 pub struct SessionArgs {
-    /// The model its sessions run on (opus, sonnet, haiku, fable or a
-    /// model's ID); `default` for the project's.
+    /// Coding agent that runs the schedule.
+    #[arg(long, value_enum)]
+    pub agent: Option<AgentArg>,
+    /// Model alias or ID; `default` for the project's.
     #[arg(long)]
     pub model: Option<String>,
-    /// Their effort level (low, medium, high, xhigh, max); `default` for
-    /// the project's.
+    /// Effort level; `default` for the project's.
     #[arg(long)]
     pub effort: Option<String>,
     /// What their agents may do on GitHub (push, comment, triage, read);
@@ -186,7 +188,7 @@ pub enum SchedulesCmd {
     /// The project's schedules (the default).
     #[command(visible_alias = "ls")]
     List,
-    /// Set up a schedule, on your Claude subscription.
+    /// Set up a schedule, on your subscription.
     #[command(after_help = "Examples:
   fctl schedules add \"Weekly dependencies\" --cron \"0 9 * * 1\" --tz Europe/Stockholm \\
     -m \"Update the dependencies that have new patch or minor releases, run the tests and open a pull request.\"
@@ -229,7 +231,7 @@ pub enum SchedulesCmd {
         schedule: String,
     },
     /// Change a schedule. Changing someone else's (as one of the project's
-    /// maintainers or owners) runs it on your Claude subscription.
+    /// maintainers or owners) runs it on your subscription.
     #[command(after_help = "Examples:
   fctl schedules edit \"Weekly dependencies\" --cron \"0 7 * * 1\"
   fctl schedules edit \"Triage new issues\" --on issue-opened --label bug   # bug reports alone
@@ -253,7 +255,7 @@ pub enum SchedulesCmd {
         when: WhenArgs,
         #[command(flatten)]
         session: SessionArgs,
-        /// Run it on your Claude subscription from now on.
+        /// Run it on your subscription from now on.
         #[arg(long)]
         mine: bool,
         /// Keep its sessions, those it started already too, off session
@@ -371,6 +373,7 @@ pub async fn run(server: Option<&str>, args: SchedulesArgs, json: bool) -> Resul
                 timezone: Some(when.tz.clone().unwrap_or_else(local_zone)),
                 model: chosen(session.model),
                 effort: chosen(session.effort),
+                agent_kind: session.agent.map(Into::into),
                 base_branch: chosen(session.base),
                 github_access: match chosen(session.github) {
                     Some(g) => Some(access(&g)?),
@@ -379,6 +382,7 @@ pub async fn run(server: Option<&str>, args: SchedulesArgs, json: bool) -> Resul
                 hide_sessions: hide_sessions.then_some(true),
                 enabled: paused.then_some(false),
             };
+            require_supported(&api, req.agent_kind).await?;
             let s = api.create_schedule(&project, &req).await?;
             if json {
                 return style::print_json(&s);
@@ -389,10 +393,11 @@ pub async fn run(server: Option<&str>, args: SchedulesArgs, json: bool) -> Resul
                 style::bold(&style::terminal_safe(&s.name))
             );
             println!("  {}", style::dim(&when_line(&s)));
+            let plan = subscription(s.agent_kind);
             let on = if s.cron.is_none() && s.at.is_none() && s.event.is_none() {
-                "Each run starts on the Claude subscription of whoever runs it"
+                format!("Each run starts on the {plan} of whoever runs it")
             } else {
-                "Its runs start on your Claude subscription"
+                format!("Its runs start on your {plan}")
             };
             if let Some(problem) = &s.problem {
                 println!("  {}", style::amber(&style::terminal_safe(problem)));
@@ -419,6 +424,9 @@ pub async fn run(server: Option<&str>, args: SchedulesArgs, json: bool) -> Resul
                 println!("  {:<14}{}", style::dim(k), style::terminal_safe(&v))
             };
             println!();
+            if let Some(agent) = s.agent_kind {
+                row("Agent", agent.as_str().into());
+            }
             row(
                 "Model",
                 s.model.clone().unwrap_or_else(|| "the project's".into()),
@@ -495,6 +503,7 @@ pub async fn run(server: Option<&str>, args: SchedulesArgs, json: bool) -> Resul
                 timezone: when.tz,
                 model: blank(session.model),
                 effort: blank(session.effort),
+                agent_kind: session.agent.map(Into::into),
                 base_branch: blank(session.base),
                 github_access: match blank(session.github) {
                     Some(g) if g.is_empty() => Some(g),
@@ -514,6 +523,7 @@ pub async fn run(server: Option<&str>, args: SchedulesArgs, json: bool) -> Resul
                     "Nothing to change: pass what changes, like --cron, --on or --task (fctl schedules edit --help)."
                 );
             }
+            require_supported(&api, req.agent_kind).await?;
             let s = api.update_schedule(s.id.as_str(), &req).await?;
             if json {
                 return style::print_json(&s);
@@ -562,14 +572,15 @@ pub async fn run(server: Option<&str>, args: SchedulesArgs, json: bool) -> Resul
                     let service_account = api.token().is_some_and(|t| {
                         t.starts_with(fctl_domain::tokens::SecretKind::Service.prefix())
                     });
+                    let plan = subscription(s.agent_kind);
                     let said = match (&run.by, service_account) {
                         (Some(by), true) => format!(
-                            "It runs for {}, on their Claude subscription. Read what its agent does: fctl logs {}",
+                            "It runs for {}, on their {plan}. Read what its agent does: fctl logs {}",
                             style::plain(&by.name),
                             session.id
                         ),
                         _ => format!(
-                            "It runs on your Claude subscription. Follow it: fctl attach {}",
+                            "It runs on your {plan}. Follow it: fctl attach {}",
                             session.id
                         ),
                     };
@@ -859,7 +870,11 @@ fn print_schedule(s: &Schedule) {
         Some(owner) if s.cron.is_none() && s.at.is_none() && s.event.is_none() => {
             facts.push(format!("set up by {}", owner.name))
         }
-        Some(owner) => facts.push(format!("on {}'s Claude subscription", owner.name)),
+        Some(owner) => facts.push(format!(
+            "on {}'s {}",
+            owner.name,
+            subscription(s.agent_kind)
+        )),
         None => {}
     }
     println!(

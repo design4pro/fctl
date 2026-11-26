@@ -5,7 +5,7 @@ import type { SignInInfo } from "./SignInInfo";
 /**
  * `GET /api/v1/instance` (public): what the sign-in page needs to know.
  */
-export type InstanceInfo = { name: string, version: string, 
+export type InstanceInfo = { name: string, version: string, codex_enabled?: boolean, 
 /**
  * No owner yet: the setup link must be used first.
  */

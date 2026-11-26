@@ -22,7 +22,7 @@ use crate::runner::{
 };
 use crate::session::SessionStatus;
 use crate::uplink::{AgentEvent, Delivery, SessionState};
-use crate::{ApiError, DeliveryId, SessionId};
+use crate::{ApiError, DeliveryId, Millis, SessionId};
 use serde::{Deserialize, Serialize};
 use serde_with::skip_serializing_none;
 use std::collections::BTreeMap;
@@ -151,6 +151,9 @@ pub enum HostToAgent {
         claude: Option<ClaudeCredential>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         #[cfg_attr(feature = "ts", ts(optional))]
+        codex: Option<crate::runner::CodexCredential>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[cfg_attr(feature = "ts", ts(optional))]
         github: Option<GithubCredential>,
         /// See [`crate::runner::SessionCredentials::github_read`].
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -165,6 +168,14 @@ pub enum HostToAgent {
         reason: StopReason,
         grace_ms: u64,
     },
+    /// Another session on this ChatGPT connection reached its usage limit.
+    PauseCodex {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[cfg_attr(feature = "ts", ts(optional))]
+        reset_at: Option<Millis>,
+    },
+    /// The ChatGPT connection can run again after a usage pause.
+    ResumeCodex,
     /// The answer to [`AgentToHost::Publish`]: the published file, or why
     /// it wasn't published.
     Published {
@@ -208,6 +219,7 @@ pub enum HostToAgent {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[cfg_attr(feature = "ts", derive(ts_rs::TS), ts(optional_fields))]
 pub struct AgentHello {
+    pub agent_kind: Option<crate::session::AgentKind>,
     pub protocol: u32,
     pub version: String,
     pub configured: bool,

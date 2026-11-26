@@ -6,6 +6,7 @@ import { useMutation, useQueryClient } from "@tanstack/react-query";
 import { Button, Dialog, toast } from "@/components/ui";
 import type * as G from "@/gen";
 import { api } from "@/lib/api";
+import { planName } from "@/lib/models";
 import { patchSession } from "@/lib/queries";
 import type { TakeOver } from "@/lib/subscription";
 
@@ -22,18 +23,18 @@ export function TakeOverDialog({
   onClose: () => void;
 }) {
   const queryClient = useQueryClient();
+  const plan = planName(session.agent_kind);
+  const agent = session.agent_kind === "codex" ? "Codex" : "Claude";
   const move = useMutation({
     mutationFn: () => api.takeOver(session.id),
     onSuccess: (updated) => {
       patchSession(queryClient, updated);
-      toast("It continues on your Claude subscription");
+      toast(`It continues on your ${plan}`);
       onClose();
     },
     onError: (e) => toast(e.message, "error"),
   });
-  const from = takeOver.whose
-    ? `${takeOver.whose}'s Claude subscription`
-    : "another of your Claude connections";
+  const from = takeOver.whose ? `${takeOver.whose}'s ${plan}` : "another of your Claude connections";
   const then =
     session.status === "stopped" || session.status === "stopping"
       ? "It resumes on yours"
@@ -43,7 +44,7 @@ export function TakeOverDialog({
       open={open}
       onClose={onClose}
       title="Continue it on your subscription?"
-      description={`It runs on ${from}. ${then}, the connection you chose for this workspace in Settings → Claude, and Claude continues the same conversation. Messages from then on run on yours too.`}
+      description={`It runs on ${from}. ${then}, the connection you chose for this workspace in Settings → ${agent}, and ${agent} continues the same conversation. Messages from then on run on yours too.`}
     >
       <div className="flex justify-end gap-2">
         <Button variant="ghost" onClick={onClose}>

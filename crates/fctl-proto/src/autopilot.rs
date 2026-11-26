@@ -192,6 +192,7 @@ pub struct Autopilot {
     /// project's.
     pub model: Option<String>,
     pub effort: Option<String>,
+    pub agent_kind: Option<crate::session::AgentKind>,
     /// The context size, in tokens, at which a fresh session of its own
     /// takes over from the one it works in: the first wake that finds that
     /// one between turns with this many tokens in its context, or more,
@@ -805,6 +806,7 @@ pub struct PutAutopilotRequest {
     /// `"default"` for the project's.
     pub model: Option<String>,
     pub effort: Option<String>,
+    pub agent_kind: Option<crate::session::AgentKind>,
     /// Where a fresh session takes over from its own
     /// (`Autopilot.handoff_at`), 100,000 to 1,000,000 tokens; `0` for only
     /// after 12 hours.

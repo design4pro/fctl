@@ -66,7 +66,7 @@ import { cn } from "@/lib/cn";
 import { ago, agoShort, stamp } from "@/lib/format";
 import { githubLevel, lowerAccess, onGithub, tracksTickets, within } from "@/lib/github-access";
 import { siteUrl } from "@/lib/install";
-import { asked, type Choice, effortLabel, modelLabel, projectChoice } from "@/lib/models";
+import { asked, type Choice, effortLabel, modelLabel, planName, projectChoice } from "@/lib/models";
 import { keys, queryClient, useMe, useProjectRepos } from "@/lib/queries";
 import {
   anyoneStarts,
@@ -269,6 +269,7 @@ export interface Draft {
   event?: G.ScheduleEvent;
   /** Its sessions stay off session lists. */
   hide?: boolean;
+  agent_kind?: G.AgentKind;
   model?: string;
   effort?: string;
   github?: G.GithubAccess;
@@ -324,6 +325,7 @@ export function ScheduleButton({
       onClick={() => {
         handOver(project.id, {
           prompt,
+          agent_kind: choice.agent_kind,
           model: choice.model,
           effort: choice.effort,
           github: choice.github,
@@ -798,6 +800,7 @@ function Item({
 }) {
   const { data: me } = useMe();
   const mine = !!me && s.owner?.id === me.user.id;
+  const plan = planName(s.agent_kind);
   const rights = scheduleRights(project.role, mine);
   const [editing, setEditing] = useState(false);
   const [dialog, setDialog] = useState<"delete" | "resume" | "take" | "run">();
@@ -816,7 +819,7 @@ function Item({
             ? n.next_run_at
               ? `Resumed: it runs next ${soon(n.next_run_at, n.timezone)}`
               : "Resumed"
-            : "It runs on your Claude subscription now",
+            : `It runs on your ${planName(n.agent_kind ?? project.settings.agent_kind)} now`,
       );
     },
     onError: (e) => toast(e.message, "error"),
@@ -873,7 +876,7 @@ function Item({
               className="flex max-sm:hidden"
               title={
                 s.cron || s.at !== undefined || s.event
-                  ? `Runs on ${s.owner.name}'s Claude subscription`
+                  ? `Runs on ${s.owner.name}'s ${plan}`
                   : `Set up by ${s.owner.name}`
               }
             >
@@ -888,8 +891,8 @@ function Item({
               loading={run.isPending}
               // One that waits for events runs on the issue, pull request or branch you name.
               onClick={() => (s.event ? setDialog("run") : run.mutate(undefined))}
-              aria-label={`Run ${s.name} now, on your Claude subscription`}
-              title="Run now, on your Claude subscription"
+              aria-label={`Run ${s.name} now, on your ${plan}`}
+              title={`Run now, on your ${plan}`}
               className="max-sm:px-2 sm:min-w-24 [&>span]:max-sm:sr-only"
             >
               {/* One that waits for events asks what to run it on first. */}
@@ -904,8 +907,8 @@ function Item({
               icon={<Play className="size-3.5" />}
               loading={update.isPending}
               onClick={resume}
-              aria-label={mine ? `Resume ${s.name}` : `Resume ${s.name} on your Claude subscription`}
-              title={mine ? "Resume it" : "Resume it on your Claude subscription"}
+              aria-label={mine ? `Resume ${s.name}` : `Resume ${s.name} on your ${plan}`}
+              title={mine ? "Resume it" : `Resume it on your ${plan}`}
               className="max-sm:px-2 sm:min-w-24 [&>span]:max-sm:sr-only"
             >
               <span>Resume</span>
@@ -1014,7 +1017,7 @@ function Item({
         open={dialog === "resume" || dialog === "take"}
         onClose={() => setDialog(undefined)}
         title={dialog === "resume" ? "Resume it on your subscription?" : "Run it on your subscription?"}
-        description={`It ran on ${s.owner?.name ?? "someone else"}'s Claude subscription. From now on its runs start on yours, and it's yours to change.`}
+        description={`It ran on ${s.owner?.name ?? "someone else"}'s ${plan}. From now on its runs start on yours, and it's yours to change.`}
       >
         <div className="flex justify-end gap-2">
           <Button variant="ghost" onClick={() => setDialog(undefined)}>
@@ -1085,7 +1088,7 @@ function Details({
   onResume: () => void;
   pending: boolean;
 }) {
-  const own = projectChoice(project);
+  const own = projectChoice(project, s.agent_kind ?? "claude");
   const coming = useMemo(() => {
     if (s.state !== "active" || !s.next_run_at) return [];
     if (!s.cron) return [s.next_run_at];
@@ -1122,9 +1125,15 @@ function Details({
               </span>
             </Fact>
           )}
-          <Fact k="Model">{s.model ? modelLabel(s.model) : `The project's (${modelLabel(own.model)})`}</Fact>
+          <Fact k="Model">
+            {s.model
+              ? modelLabel(s.model, own.agent_kind)
+              : `The project's (${modelLabel(own.model, own.agent_kind)})`}
+          </Fact>
           <Fact k="Effort">
-            {s.effort ? effortLabel(s.effort) : `The project's (${effortLabel(own.effort)})`}
+            {s.effort
+              ? effortLabel(s.effort, own.agent_kind)
+              : `The project's (${effortLabel(own.effort, own.agent_kind)})`}
           </Fact>
           {onGithub(project) && (
             <Fact k="On GitHub">
@@ -1473,7 +1482,7 @@ function RunOnDialog({
       open={open}
       onClose={onClose}
       title={`Run ${s.name} now?`}
-      description="It starts a session on your Claude subscription. Its agent gets the task with what you name here, as it would get what happened on GitHub."
+      description={`It starts a session on your ${planName(s.agent_kind)}. Its agent gets the task with what you name here, as it would get what happened on GitHub.`}
     >
       <form
         className="flex flex-col gap-5"
@@ -1654,11 +1663,15 @@ function Editor({
 }) {
   const { data: me } = useMe();
   const here = useMemo(browserZone, []);
-  const own = projectChoice(project);
+  const own = projectChoice(
+    project,
+    schedule ? (schedule.agent_kind ?? "claude") : (draft?.agent_kind ?? project.settings.agent_kind),
+  );
   const mine = !schedule || (!!me && schedule.owner?.id === me.user.id);
   const [name, setName] = useState(schedule?.name ?? draft?.name ?? "");
   const [prompt, setPrompt] = useState(schedule?.prompt ?? draft?.prompt ?? "");
   const [choice, setChoice] = useState<Choice>(() => ({
+    agent_kind: own.agent_kind,
     model: schedule?.model ?? draft?.model ?? own.model,
     effort: schedule?.effort ?? draft?.effort ?? own.effort,
     github: lowerAccess(schedule?.github_access ?? draft?.github ?? own.github, own.github),
@@ -1705,6 +1718,7 @@ function Editor({
   const fallback = defaultAccess(waitsFor, own.github);
   const picked: Choice = githubPicked ? choice : { ...choice, github: fallback };
   const githubAsked = picked.github !== fallback ? picked.github : undefined;
+  const plan = planName(picked.agent_kind);
   const atTime = mode === "once" ? fromWall(zone, once.date, once.time) : Number.NaN;
   const whenProblem =
     mode === "asked"
@@ -1747,6 +1761,7 @@ function Editor({
           timezone: zone,
           ...timing,
           ...asks,
+          ...(picked.agent_kind === "codex" && { agent_kind: "codex" }),
           github_access: githubAsked,
           hide_sessions: hidden || undefined,
         };
@@ -1759,6 +1774,7 @@ function Editor({
         ...timing,
         model: asks.model ?? "",
         effort: asks.effort ?? "",
+        agent_kind: picked.agent_kind !== (schedule.agent_kind ?? "claude") ? picked.agent_kind : undefined,
         github_access: githubAsked ?? "",
         hide_sessions: hidden,
       };
@@ -1895,9 +1911,9 @@ function Editor({
             />
           </TextareaControls>
         </div>
-        {fieldError("prompt", "model", "effort", "github_access") && (
+        {fieldError("prompt", "model", "effort", "agent_kind", "github_access") && (
           <p className="text-[12.5px] text-danger">
-            {fieldError("prompt", "model", "effort", "github_access")}
+            {fieldError("prompt", "model", "effort", "agent_kind", "github_access")}
           </p>
         )}
       </div>
@@ -2025,11 +2041,11 @@ function Editor({
 
       {save.error && !failure?.field && <Banner tone="error">{save.error.message}</Banner>}
       {failure?.field === "event" && <Banner tone="error">{failure.message}</Banner>}
-      {failure?.field === "claude" && (
+      {(failure?.field === "claude" || failure?.field === "codex") && (
         <Banner tone="error">
           {failure.message}{" "}
-          <Link to="/settings" search={{ tab: "claude" }} className="underline underline-offset-2">
-            Connect Claude
+          <Link to="/settings" search={{ tab: failure.field }} className="underline underline-offset-2">
+            {failure.field === "codex" ? "Connect your ChatGPT plan" : "Connect Claude"}
           </Link>
         </Banner>
       )}
@@ -2038,10 +2054,10 @@ function Editor({
         <p className="flex min-w-0 items-center gap-2 text-[12.5px] leading-snug text-ink-3">
           {me && <Avatar user={me.user} size={18} />}
           {mode === "asked"
-            ? "Each run starts on the Claude subscription of whoever runs it."
+            ? `Each run starts on the ${plan} of whoever runs it.`
             : takesOver
-              ? `Saving runs it on your Claude subscription, instead of ${schedule?.owner?.name ?? "its owner"}'s.`
-              : "Its runs start on your Claude subscription."}
+              ? `Saving runs it on your ${plan}, instead of ${schedule?.owner?.name ?? "its owner"}'s.`
+              : `Its runs start on your ${plan}.`}
         </p>
         <div className="flex gap-2 max-sm:ml-auto">
           <Button variant="ghost" onClick={() => onDone()}>

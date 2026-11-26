@@ -73,6 +73,31 @@ const ended = (id: string, summary: string, status = "completed") =>
 const call = (items: Item[], i = 0) => items[i] as Tool;
 
 describe("TranscriptBuilder", () => {
+  it("reads Codex assistant and tool events and keeps its plan limit distinct", () => {
+    const b = new TranscriptBuilder();
+    const items = b.add([
+      ev("codex", {
+        type: "assistant",
+        message: {
+          id: "m",
+          role: "assistant",
+          content: [
+            { type: "text", text: "Checking results." },
+            { type: "tool_use", id: "tool", name: "Bash", input: { command: "true" } },
+          ],
+        },
+      }),
+      ev("codex", {
+        type: "user",
+        message: { role: "user", content: [{ type: "tool_result", tool_use_id: "tool", content: "ok" }] },
+      }),
+      ev("codex_limit", { reset_at: 12345 }),
+    ]);
+    expect(items.map((item) => item.kind)).toEqual(["prose", "tool", "codex_limit"]);
+    expect(items[1]).toMatchObject({ result: { text: "ok" } });
+    expect(items[2]).toMatchObject({ resetsAt: 12345 });
+  });
+
   it("groups setup steps and closes them when Claude starts", () => {
     const b = new TranscriptBuilder();
     const items = b.add([

@@ -15,15 +15,35 @@ import {
   useRef,
   useState,
 } from "react";
+import { CodexPlan } from "@/components/codex/plan";
 import { GithubAccessIcon } from "@/components/github-access";
-import { EffortIcon, LinearIcon, Select, Spinner, toast } from "@/components/ui";
+import {
+  Button,
+  Dialog,
+  EffortIcon,
+  Field,
+  Input,
+  LinearIcon,
+  Select,
+  Spinner,
+  toast,
+} from "@/components/ui";
 import type * as G from "@/gen";
 import { api } from "@/lib/api";
 import { cn } from "@/lib/cn";
 import { type DraftText, forgetDraft, saveText } from "@/lib/draft";
 import { githubOffers, issuesOffers, offersIssues, onGithub } from "@/lib/github-access";
-import { type Choice, effortOffers, modelOffers, type Offer, startChoice } from "@/lib/models";
-import { keys } from "@/lib/queries";
+import {
+  AGENTS,
+  type Choice,
+  effortOffers,
+  modelOffers,
+  type Offer,
+  projectChoice,
+  startChoice,
+} from "@/lib/models";
+import { keys, useCodexSettings } from "@/lib/queries";
+import { chosenCodexConnection } from "@/lib/subscription";
 import type { SentFiles } from "./attachments";
 
 /** The files a start form holds (see `useAttachments`). */
@@ -33,7 +53,10 @@ export interface StartFiles {
 }
 
 /** The model, effort level and GitHub access a session asks for as it starts (see `asked`). */
-export type StartAsks = Pick<G.CreateSessionRequest, "model" | "effort" | "github_access" | "github_issues">;
+export type StartAsks = Pick<
+  G.CreateSessionRequest,
+  "agent_kind" | "model" | "effort" | "github_access" | "github_issues"
+>;
 
 /**
  * Starts a session and opens it. While a start is in flight, `start` does nothing, so a double
@@ -64,6 +87,7 @@ export function useStartSession(onStarted?: (s: G.Session) => unknown) {
       const attachments = taken?.files.attachments.map((a) => a.id) ?? [];
       const body: G.CreateSessionRequest = { prompt };
       if (attachments.length) body.attachments = attachments;
+      if (asks?.agent_kind) body.agent_kind = asks.agent_kind;
       if (asks?.model) body.model = asks.model;
       if (asks?.effort) body.effort = asks.effort;
       if (asks?.github_access) body.github_access = asks.github_access;
@@ -130,9 +154,9 @@ export function useKeepDraft(
     const empty = !text.prompt.trim() && !files;
     saveText(keep, empty ? undefined : { ...text, selection: caret.current });
   };
-  const { prompt, project, model, effort, github } = text;
+  const { prompt, project, agent_kind, model, effort, github } = text;
   // biome-ignore lint/correctness/useExhaustiveDependencies: saves when the draft changes
-  useEffect(() => save.current(), [prompt, project, model, effort, github, files]);
+  useEffect(() => save.current(), [prompt, project, agent_kind, model, effort, github, files]);
   useEffect(() => () => save.current(), []);
   useLayoutEffect(() => {
     const s = kept?.selection;
@@ -162,6 +186,7 @@ type ChoiceProject = Parameters<typeof startChoice>[0] &
  */
 export function useStartChoice(project: ChoiceProject | undefined, kept?: Partial<Choice>) {
   const [picked, setPicked] = useState<Partial<Choice>>(() => ({
+    agent_kind: kept?.agent_kind,
     model: kept?.model,
     effort: kept?.effort,
     github: kept?.github,
@@ -182,6 +207,17 @@ const MODEL = { key: "model", label: "Model" };
 const EFFORT = { key: "effort", label: "Effort" };
 const GITHUB = { key: "github", label: "On GitHub" };
 const ISSUES = { key: "issues", label: "Issues" };
+const CUSTOM_MODEL = "!custom-model";
+
+export function StartPlan({ choice, workspace }: { choice: Choice; workspace?: string }) {
+  const codex = useCodexSettings(choice.agent_kind === "codex").data;
+  if (choice.agent_kind !== "codex" || !codex?.enabled) return null;
+  return (
+    <div className="px-3">
+      <CodexPlan connection={chosenCodexConnection(codex, workspace)} />
+    </div>
+  );
+}
 
 /** Where the project's own setting is, which sessions follow unless they ask for another. */
 const theirs = (o: Offer) => (o.own ? "The project's default" : undefined);
@@ -227,13 +263,56 @@ export function StartChoices({
 }) {
   const github = onGithub(project);
   const beyond = issues && offersIssues(project);
+  const agent = choice.agent_kind ?? project.settings.agent_kind ?? "claude";
+  const codex = useCodexSettings().data?.enabled === true;
+  const showAgents = codex || agent === "codex";
+  const [modelId, setModelId] = useState<string>();
+  const models = modelOffers(project, choice.model, agent).map((o) => ({
+    value: o.value,
+    label: o.value ? o.label : "Default model",
+    short: o.value ? o.label : "Default",
+    item: o.label,
+    description: theirs(o),
+    section: MODEL,
+  }));
+  if (agent === "codex")
+    models.push({
+      value: CUSTOM_MODEL,
+      label: "Model ID…",
+      short: "Model ID",
+      item: "Model ID…",
+      description: undefined,
+      section: MODEL,
+    });
+  const useModelId = () => {
+    const model = modelId?.trim();
+    if (!model) return;
+    onPick({ model, agent_kind: "codex" });
+    setModelId(undefined);
+  };
   return (
     <div
+      data-agent-picker={showAgents || undefined}
       className={cn(
         "flex min-w-0 items-center gap-2 max-sm:gap-0 sm:max-lg:order-first sm:max-lg:w-full",
+        showAgents && "max-sm:order-first max-sm:w-full",
         className,
       )}
     >
+      {showAgents && (
+        <Select
+          size="sm"
+          aria-label="Agent"
+          value={agent}
+          disabled={disabled}
+          options={AGENTS.map((a) => ({ ...a, disabled: a.value === "codex" && !codex }))}
+          onChange={(next) => {
+            const own = projectChoice(project, next);
+            onPick({ agent_kind: next, model: own.model, effort: own.effort });
+          }}
+          className="mr-2 shrink-0 sm:mr-0"
+        />
+      )}
       <Select
         size="sm"
         narrow="bare"
@@ -243,16 +322,28 @@ export function StartChoices({
         aria-label="Model"
         value={choice.model}
         disabled={disabled}
-        onChange={(model) => onPick({ model })}
-        options={modelOffers(project, choice.model).map((o) => ({
-          value: o.value,
-          label: o.value ? o.label : "Default model",
-          short: o.value ? o.label : "Default",
-          item: o.label,
-          description: theirs(o),
-          section: MODEL,
-        }))}
+        onChange={(model) =>
+          model === CUSTOM_MODEL ? setModelId(choice.model) : onPick({ model, agent_kind: choice.agent_kind })
+        }
+        options={models}
       />
+      <Dialog open={modelId !== undefined} onClose={() => setModelId(undefined)} title="Choose a Codex model">
+        <Field label="Model ID">
+          {(id) => (
+            <Input
+              id={id}
+              className="w-full"
+              value={modelId ?? ""}
+              onChange={(e) => setModelId(e.target.value)}
+            />
+          )}
+        </Field>
+        <div className="mt-4 flex justify-end">
+          <Button type="button" variant="primary" disabled={!modelId?.trim()} onClick={useModelId}>
+            Use model
+          </Button>
+        </div>
+      </Dialog>
       <Select
         size="sm"
         narrow="bare"
@@ -264,8 +355,8 @@ export function StartChoices({
         aria-label="Effort"
         value={choice.effort}
         disabled={disabled}
-        onChange={(effort) => onPick({ effort })}
-        options={effortOffers(project, choice.effort).map((o) => ({
+        onChange={(effort) => onPick({ effort, agent_kind: choice.agent_kind })}
+        options={effortOffers(project, choice.effort, agent).map((o) => ({
           value: o.value,
           label: effortText(o),
           short: "",

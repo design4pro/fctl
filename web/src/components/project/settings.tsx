@@ -70,7 +70,15 @@ import {
   type Typed,
   withSource,
 } from "@/lib/images";
-import { ALIASES, chosenModel, EFFORTS, type ModelChoice, modelChoice } from "@/lib/models";
+import {
+  AGENTS,
+  ALIASES,
+  CODEX_EFFORTS,
+  chosenModel,
+  EFFORTS,
+  type ModelChoice,
+  modelChoice,
+} from "@/lib/models";
 import {
   FALLBACKS,
   fallbackOf,
@@ -95,7 +103,15 @@ import {
   settingsPagesFor,
 } from "@/lib/project-page";
 import { DAY_CHOICES, DEFAULT_DAYS, lasts } from "@/lib/published";
-import { keys, queryClient, useInstance, useMe, useRunners, useWorkspace } from "@/lib/queries";
+import {
+  keys,
+  queryClient,
+  useCodexSettings,
+  useInstance,
+  useMe,
+  useRunners,
+  useWorkspace,
+} from "@/lib/queries";
 import type { Gist } from "@/lib/settings";
 import type { LinearOutcome } from "@/lib/tickets";
 
@@ -479,6 +495,9 @@ function General({ project }: { project: G.Project }) {
 const agentSettings = (s: G.ProjectSettings) => ({
   /** The model as chosen in its list: Model ID before one is typed sets none yet. */
   choice: modelChoice(s.model),
+  agent_kind: s.agent_kind,
+  codex_model: s.codex_model ?? null,
+  codex_effort: s.codex_effort ?? null,
   instructions: s.instructions,
   model: s.model,
   effort: s.effort,
@@ -506,6 +525,8 @@ function Agents({ project }: { project: G.Project }) {
   // Cancel, or someone's change elsewhere.
   const { draft: s, set, setDraft, dirty, reset } = useDraft(agentSettings(project.settings));
   const model = s.choice;
+  const codex = s.agent_kind === "codex";
+  const codexEnabled = useCodexSettings().data?.enabled === true;
   /** The model ID typed last, so that choosing Model ID again brings it back. */
   const typedModel = useRef<string>(undefined);
   /**
@@ -518,30 +539,54 @@ function Agents({ project }: { project: G.Project }) {
     "Saved: sessions that start from now on take it",
     () => {
       const { choice, compact, compactTyped, ...settings } = s;
-      if (choice === "id" && !settings.model?.trim())
+      if (!codex && choice === "id" && !settings.model?.trim())
         throw new ApiFailure(400, {
           code: "validation",
           field: "model",
           message: "Type a model ID, or choose another model",
         });
       return {
-        settings: { ...project.settings, ...settings, compact_window: compactWindow(compact, compactTyped) },
+        settings: {
+          ...project.settings,
+          ...settings,
+          codex_model: settings.codex_model?.trim() || null,
+          compact_window: codex ? project.settings.compact_window : compactWindow(compact, compactTyped),
+        },
       };
     },
     (p) => setDraft(agentSettings(p.settings)),
   );
   const err = (f: string) => (failedField(save.error) === f ? save.error?.message : undefined);
   return (
-    <Section title="Agents" description="What Claude is told and how it works in this project.">
+    <Section title="Agents" description="What the agent is told and how it works in this project.">
       <form
         onSubmit={(e) => {
           e.preventDefault();
           if (dirty) save.mutate();
         }}
       >
+        {(codexEnabled || codex || project.settings.agent_kind === "codex") && (
+          <div className="mb-4">
+            <Field label="Default agent" error={err("settings.agent_kind")}>
+              {(id) => (
+                <Select
+                  id={id}
+                  value={s.agent_kind ?? "claude"}
+                  onChange={(agent_kind) => set({ agent_kind })}
+                  options={AGENTS.map((a) => ({ ...a, disabled: a.value === "codex" && !codexEnabled }))}
+                  className="w-full"
+                />
+              )}
+            </Field>
+          </div>
+        )}
         <Field
           label="Instructions"
-          hint="Appended to Claude's system prompt in every session. CLAUDE.md in the repository is read too."
+          hint={
+            codex
+              ? "Added to the instructions in every session. Codex also reads AGENTS.md in the repository."
+              : "Appended to Claude's system prompt in every session. CLAUDE.md in the repository is read too."
+          }
           error={err("settings.instructions")}
         >
           {(id) => (
@@ -559,100 +604,135 @@ function Agents({ project }: { project: G.Project }) {
             title="Model"
             description="What sessions run with, unless whoever starts one chooses another."
           >
-            <div className="flex flex-col gap-4">
+            {codex ? (
               <div className="grid grid-cols-2 items-start gap-4">
-                <Field label="Model">
+                <Field label="Model ID" error={err("settings.codex_model")}>
                   {(id) => (
-                    <Select
+                    <Input
                       id={id}
-                      value={model}
-                      onChange={(v) => {
-                        if (model === "id") typedModel.current = s.model;
-                        set({ choice: v, model: chosenModel(v, typedModel.current) });
-                      }}
-                      options={MODELS}
-                      className="w-full"
+                      value={s.codex_model ?? ""}
+                      onChange={(e) => set({ codex_model: e.target.value || null })}
+                      placeholder="Codex's default"
+                      className="w-full font-mono"
+                      autoComplete="off"
+                      spellCheck={false}
                     />
                   )}
                 </Field>
-                <Field label="Effort" error={err("effort")}>
+                <Field label="Effort" error={err("settings.codex_effort")}>
                   {(id) => (
                     <Select
                       id={id}
-                      value={s.effort ?? ""}
-                      onChange={(v) => set({ effort: v || undefined })}
-                      options={EFFORT_LEVELS}
+                      value={s.codex_effort ?? ""}
+                      onChange={(v) => set({ codex_effort: v || null })}
+                      options={[{ value: "", label: "Codex's default" }, ...CODEX_EFFORTS]}
                       className="w-full"
                     />
                   )}
                 </Field>
               </div>
-              {model === "id" && (
-                <Field label="Model ID" hint="Passed to Claude Code as --model." error={err("model")}>
-                  {(id) => (
-                    <Input
-                      id={id}
-                      value={s.model ?? ""}
-                      onChange={(e) => set({ model: e.target.value || undefined })}
-                      className="font-mono"
-                      placeholder="claude-opus-5-5"
-                      autoComplete="off"
-                      autoCapitalize="off"
-                      autoCorrect="off"
-                      spellCheck={false}
-                    />
-                  )}
-                </Field>
-              )}
-            </div>
-          </Section>
-          <Section
-            title="Context"
-            description="As its context nears this size, Claude compacts the conversation into a summary of it. Each step reads the whole context again: a smaller one spends less of the plan on long sessions, and keeps less of their detail."
-          >
-            <div className="grid grid-cols-2 items-start gap-4">
-              <Field
-                label="Compact near"
-                error={s.compact === "other" ? undefined : err("settings.compact_window")}
-              >
-                {(id) => (
-                  <Select
-                    id={id}
-                    value={s.compact}
-                    onChange={(v) => {
-                      if (s.compact === "other") typedCompact.current = s.compactTyped;
-                      set({ compact: v, compactTyped: v === "other" ? (typedCompact.current ?? "") : "" });
-                    }}
-                    options={COMPACT_OPTIONS}
-                    className="w-full"
-                  />
+            ) : (
+              <div className="flex flex-col gap-4">
+                <div className="grid grid-cols-2 items-start gap-4">
+                  <Field label="Model">
+                    {(id) => (
+                      <Select
+                        id={id}
+                        value={model}
+                        onChange={(v) => {
+                          if (model === "id") typedModel.current = s.model;
+                          set({ choice: v, model: chosenModel(v, typedModel.current) });
+                        }}
+                        options={MODELS}
+                        className="w-full"
+                      />
+                    )}
+                  </Field>
+                  <Field label="Effort" error={err("effort")}>
+                    {(id) => (
+                      <Select
+                        id={id}
+                        value={s.effort ?? ""}
+                        onChange={(v) => set({ effort: v || undefined })}
+                        options={EFFORT_LEVELS}
+                        className="w-full"
+                      />
+                    )}
+                  </Field>
+                </div>
+                {model === "id" && (
+                  <Field label="Model ID" hint="Passed to Claude Code as --model." error={err("model")}>
+                    {(id) => (
+                      <Input
+                        id={id}
+                        value={s.model ?? ""}
+                        onChange={(e) => set({ model: e.target.value || undefined })}
+                        className="font-mono"
+                        placeholder="claude-opus-5-5"
+                        autoComplete="off"
+                        autoCapitalize="off"
+                        autoCorrect="off"
+                        spellCheck={false}
+                      />
+                    )}
+                  </Field>
                 )}
-              </Field>
-              {s.compact === "other" && (
+              </div>
+            )}
+          </Section>
+          {!codex && (
+            <Section
+              title="Context"
+              description="As its context nears this size, Claude compacts the conversation into a summary of it. Each step reads the whole context again: a smaller one spends less of the plan on long sessions, and keeps less of their detail."
+            >
+              <div className="grid grid-cols-2 items-start gap-4">
                 <Field
-                  label="Tokens"
-                  hint={`From ${tokensText(MIN_TOKENS)} to ${tokensText(MAX_TOKENS)}.`}
-                  error={err("settings.compact_window")}
+                  label="Compact near"
+                  error={s.compact === "other" ? undefined : err("settings.compact_window")}
                 >
                   {(id) => (
-                    <Input
+                    <Select
                       id={id}
-                      value={s.compactTyped}
-                      onChange={(e) => set({ compactTyped: e.target.value })}
-                      placeholder="300K"
-                      autoComplete="off"
-                      autoCapitalize="off"
-                      autoCorrect="off"
-                      spellCheck={false}
+                      value={s.compact}
+                      onChange={(v) => {
+                        if (s.compact === "other") typedCompact.current = s.compactTyped;
+                        set({ compact: v, compactTyped: v === "other" ? (typedCompact.current ?? "") : "" });
+                      }}
+                      options={COMPACT_OPTIONS}
+                      className="w-full"
                     />
                   )}
                 </Field>
-              )}
-            </div>
-          </Section>
+                {s.compact === "other" && (
+                  <Field
+                    label="Tokens"
+                    hint={`From ${tokensText(MIN_TOKENS)} to ${tokensText(MAX_TOKENS)}.`}
+                    error={err("settings.compact_window")}
+                  >
+                    {(id) => (
+                      <Input
+                        id={id}
+                        value={s.compactTyped}
+                        onChange={(e) => set({ compactTyped: e.target.value })}
+                        placeholder="300K"
+                        autoComplete="off"
+                        autoCapitalize="off"
+                        autoCorrect="off"
+                        spellCheck={false}
+                      />
+                    )}
+                  </Field>
+                )}
+              </div>
+            </Section>
+          )}
           <Section
             title="Access"
-            description="What agents may do on GitHub and use of a Claude account, and where people follow them."
+            description={
+              codex
+                ? "What agents may do on GitHub."
+                : "What agents may do on GitHub and use of a Claude account, and where people follow them."
+            }
           >
             <Field
               label="Agents on GitHub"
@@ -673,20 +753,22 @@ function Agents({ project }: { project: G.Project }) {
                 />
               )}
             </Field>
-            <SwitchRows className="mt-6">
-              <SwitchRow
-                label="claude.ai connectors"
-                hint="Agents can use the connectors of the person who starts a session (mail, files, docs) without asking. Only with a full Claude login."
-                checked={s.claude_ai_connectors}
-                onChange={(v) => set({ claude_ai_connectors: v })}
-              />
-              <SwitchRow
-                label="Remote Control"
-                hint="Follow sessions in claude.ai/code and the Claude apps (needs a full Claude login)."
-                checked={s.remote_control}
-                onChange={(v) => set({ remote_control: v })}
-              />
-            </SwitchRows>
+            {!codex && (
+              <SwitchRows className="mt-6">
+                <SwitchRow
+                  label="claude.ai connectors"
+                  hint="Agents can use the connectors of the person who starts a session (mail, files, docs) without asking. Only with a full Claude login."
+                  checked={s.claude_ai_connectors}
+                  onChange={(v) => set({ claude_ai_connectors: v })}
+                />
+                <SwitchRow
+                  label="Remote Control"
+                  hint="Follow sessions in claude.ai/code and the Claude apps (needs a full Claude login)."
+                  checked={s.remote_control}
+                  onChange={(v) => set({ remote_control: v })}
+                />
+              </SwitchRows>
+            )}
           </Section>
           <Section title="Memory" description="What agents leave for the agents and people after them.">
             <SwitchRows>

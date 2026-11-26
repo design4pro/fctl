@@ -49,15 +49,18 @@ import { ApiFailure, api } from "@/lib/api";
 import { cn } from "@/lib/cn";
 import { ago, agoShort, duration, stamp } from "@/lib/format";
 import {
+  AGENTS,
   ALIASES,
   chosenModel,
-  EFFORTS,
   effortLabel,
+  effortLevels,
   type ModelChoice,
   modelChoice,
   modelLabel,
+  planName,
+  projectChoice,
 } from "@/lib/models";
-import { keys, queryClient, useMe } from "@/lib/queries";
+import { keys, queryClient, useCodexSettings, useMe } from "@/lib/queries";
 import { accountOf, postedAsGithubApp, postsAllAs, postsAs } from "@/lib/review-app";
 import { botView, sameBots } from "@/lib/review-bots";
 import {
@@ -182,6 +185,9 @@ const POINTS = [
 /** What review agents do, for a project that never had them on, and how to turn them on. */
 function Intro({ project, agents }: { project: G.Project; agents: G.ReviewAgents }) {
   const owner = canManageReviews(project.role);
+  const initialAgent = agents.agent_kind ?? project.settings.agent_kind ?? "claude";
+  const [agent, setAgent] = useState(initialAgent);
+  const codexEnabled = useCodexSettings().data?.enabled === true;
   const on = useUpdate(project, () =>
     toast("Review agents are on: the next commit of each pull request gets a review"),
   );
@@ -222,22 +228,45 @@ function Intro({ project, agents }: { project: G.Project; agents: G.ReviewAgents
         {on.error && <OnError error={on.error} />}
         {owner ? (
           <div className="mt-8 flex flex-wrap items-center gap-x-4 gap-y-3">
+            {(codexEnabled || initialAgent === "codex") && (
+              <div className="basis-full">
+                <Field label="Review agent">
+                  {(id) => (
+                    <Select
+                      id={id}
+                      value={agent}
+                      onChange={setAgent}
+                      options={AGENTS.map((a) => ({ ...a, disabled: a.value === "codex" && !codexEnabled }))}
+                    />
+                  )}
+                </Field>
+              </div>
+            )}
             <Button
               variant="primary"
               size="lg"
               loading={on.isPending}
-              onClick={() => on.mutate({ enabled: true })}
+              onClick={() =>
+                on.mutate({
+                  enabled: true,
+                  ...(agent !== (agents.agent_kind ?? "claude") && {
+                    agent_kind: agent,
+                    model: "",
+                    effort: "",
+                  }),
+                })
+              }
             >
               Turn on review agents
             </Button>
             <span className="text-[12.5px] leading-snug text-ink-4">
-              They run on your Claude subscription.
+              They run on your {planName(agent)}.
               <br className="max-sm:hidden" /> Another owner can take them over.
             </span>
           </div>
         ) : (
           <p className="mt-8 text-[13px] text-ink-4">
-            The project's owners turn them on, on their Claude subscription.
+            The project's owners turn them on, on their {planName(agent)}.
           </p>
         )}
       </div>
@@ -248,15 +277,18 @@ function Intro({ project, agents }: { project: G.Project; agents: G.ReviewAgents
 
 /** Why turning them on failed, with the way out when it is a missing Claude connection. */
 function OnError({ error, className = "mt-6 max-w-xl" }: { error: Error; className?: string }) {
-  const claude = error instanceof ApiFailure && error.field === "claude";
+  const field =
+    error instanceof ApiFailure && (error.field === "claude" || error.field === "codex")
+      ? error.field
+      : undefined;
   return (
     <Banner tone="error" className={className}>
       {error.message}
-      {claude && (
+      {field && (
         <>
           {" "}
-          <Link to="/settings" search={{ tab: "claude" }} className="underline underline-offset-2">
-            Connect Claude
+          <Link to="/settings" search={{ tab: field }} className="underline underline-offset-2">
+            {field === "codex" ? "Connect your ChatGPT plan" : "Connect Claude"}
           </Link>
         </>
       )}
@@ -384,8 +416,9 @@ function Status({
   const panel = useId();
   const on = useUpdate(project, () => toast("Review agents are on"));
   const operator = agents.operator;
-  const model = agents.model ? modelLabel(agents.model) : undefined;
-  const effort = agents.effort ? effortLabel(agents.effort).toLowerCase() : undefined;
+  const agent = agents.agent_kind;
+  const model = agents.model ? modelLabel(agents.model, agent) : undefined;
+  const effort = agents.effort ? effortLabel(agents.effort, agent).toLowerCase() : undefined;
   return (
     <div>
       <div className="overflow-hidden rounded-xl border border-line bg-surface/80">
@@ -405,7 +438,7 @@ function Status({
                 // Why they review none shows below.
                 operator ? (
                   <>
-                    They run on <Whose operator={operator} mine={mine} /> Claude subscription
+                    They run on <Whose operator={operator} mine={mine} /> {planName(agent)}
                     <How model={model} effort={effort} />.
                   </>
                 ) : (
@@ -417,7 +450,7 @@ function Status({
                   <span className="text-ink-2">{repoList(agents.repos)}</span>
                   {operator && (
                     <>
-                      , on <Whose operator={operator} mine={mine} /> Claude subscription
+                      , on <Whose operator={operator} mine={mine} /> {planName(agent)}
                     </>
                   )}
                   <How model={model} effort={effort} />.{" "}
@@ -610,25 +643,30 @@ function How({ model, effort }: { model?: string; effort?: string }) {
 }
 
 /** The models review agents may run on: the project's (`""`), the aliases, or a model ID. */
-function modelOptions(project: G.Project): SelectOption<ModelChoice>[] {
-  const own = project.settings.model?.trim();
+function modelOptions(project: G.Project, agent: G.AgentKind): SelectOption<ModelChoice>[] {
+  const own = projectChoice(project, agent);
   return [
-    { value: "", label: "The project's", description: own ? modelLabel(own) : "Claude's default" },
-    ...ALIASES,
+    { value: "", label: "The project's", description: modelLabel(own.model, agent) },
+    ...(agent === "codex" ? [] : ALIASES),
     { value: "id", label: "Model ID" },
   ];
 }
 
-function effortOptions(project: G.Project): SelectOption[] {
-  const own = project.settings.effort?.trim() ?? "";
+function effortOptions(project: G.Project, agent: G.AgentKind): SelectOption[] {
+  const own = projectChoice(project, agent).effort;
   return [
-    { value: "", label: "The project's", description: effortLabel(own), icon: <EffortIcon level={own} /> },
-    ...EFFORTS.map((e) => ({ ...e, icon: <EffortIcon level={e.value} /> })),
+    {
+      value: "",
+      label: "The project's",
+      description: effortLabel(own, agent),
+      icon: <EffortIcon level={own} />,
+    },
+    ...effortLevels(agent).map((e) => ({ ...e, icon: <EffortIcon level={e.value} /> })),
   ];
 }
 
 /** The fields of the settings form that show their own errors; it shows the others below them. */
-const FIELDS = ["model", "effort", "instructions", "bots", "skipped_repos"];
+const FIELDS = ["agent_kind", "model", "effort", "instructions", "bots", "skipped_repos"];
 
 /**
  * Whose subscription they run on, the repositories they review and whether drafts get reviews, their
@@ -649,8 +687,12 @@ function SettingsForm({
   onDone: () => void;
   onTurnOff: () => void;
 }) {
-  const [model, setModel] = useState<ModelChoice>(modelChoice(agents.model));
-  const [modelId, setModelId] = useState(modelChoice(agents.model) === "id" ? (agents.model ?? "") : "");
+  const initialAgent = agents.agent_kind ?? "claude";
+  const [agent, setAgent] = useState(initialAgent);
+  const codexEnabled = useCodexSettings().data?.enabled === true;
+  const initialModel = agent === "codex" && agents.model ? "id" : modelChoice(agents.model);
+  const [model, setModel] = useState<ModelChoice>(initialModel);
+  const [modelId, setModelId] = useState(initialModel === "id" ? (agents.model ?? "") : "");
   const [effort, setEffort] = useState(agents.effort ?? "");
   const [instructions, setInstructions] = useState(agents.instructions ?? "");
   const [bots, setBots] = useState<string[]>(agents.bots);
@@ -667,14 +709,15 @@ function SettingsForm({
     toast(
       mine
         ? "Saved: the next review runs with it"
-        : "Saved: review agents run on your Claude subscription now",
+        : `Saved: review agents run on your ${planName(agent)} now`,
     );
     onDone();
   });
-  const takeOver = useUpdate(project, () => toast("Review agents run on your Claude subscription now"));
+  const takeOver = useUpdate(project, () => toast(`Review agents run on your ${planName(initialAgent)} now`));
   const err = (f: string) =>
     (save.error as { field?: string } | null)?.field === f ? save.error?.message : undefined;
   const changed =
+    agent !== initialAgent ||
     (chosenModel(model, modelId) ?? "") !== (agents.model ?? "") ||
     effort !== (agents.effort ?? "") ||
     instructions.trim() !== (agents.instructions ?? "").trim() ||
@@ -694,6 +737,7 @@ function SettingsForm({
         save.mutate({
           model: chosenModel(model, modelId) ?? "",
           effort,
+          ...(agent !== initialAgent && { agent_kind: agent }),
           instructions,
           bots,
           drafts,
@@ -710,7 +754,9 @@ function SettingsForm({
           {agents.operator && (
             <p className="mt-1.5 flex items-center gap-2 text-[13.5px] text-ink">
               <Avatar user={agents.operator} size={22} />
-              {mine ? "Your Claude subscription" : `${agents.operator.name}'s Claude subscription`}
+              {mine
+                ? `Your ${planName(initialAgent)}`
+                : `${agents.operator.name}'s ${planName(initialAgent)}`}
             </p>
           )}
         </div>
@@ -734,6 +780,23 @@ function SettingsForm({
         error={err("skipped_repos")}
       />
       <ReviewDrafts on={drafts} onChange={setDrafts} />
+      {(codexEnabled || initialAgent === "codex") && (
+        <Field label="Review agent" error={err("agent_kind")}>
+          {(id) => (
+            <Select
+              id={id}
+              value={agent}
+              options={AGENTS.map((a) => ({ ...a, disabled: a.value === "codex" && !codexEnabled }))}
+              onChange={(value) => {
+                setAgent(value);
+                setModel("");
+                setModelId("");
+                setEffort("");
+              }}
+            />
+          )}
+        </Field>
+      )}
       <div className="grid grid-cols-2 items-start gap-4">
         <Field label="Model" error={err("model")}>
           {(id) => (
@@ -741,7 +804,7 @@ function SettingsForm({
               id={id}
               value={model}
               onChange={setModel}
-              options={modelOptions(project)}
+              options={modelOptions(project, agent)}
               className="w-full"
             />
           )}
@@ -752,21 +815,25 @@ function SettingsForm({
               id={id}
               value={effort}
               onChange={setEffort}
-              options={effortOptions(project)}
+              options={effortOptions(project, agent)}
               className="w-full"
             />
           )}
         </Field>
       </div>
       {model === "id" && (
-        <Field label="Model ID" hint="Passed to Claude Code as --model." error={err("model")}>
+        <Field
+          label="Model ID"
+          hint={agent === "codex" ? "A model ID Codex supports." : "Passed to Claude Code as --model."}
+          error={err("model")}
+        >
           {(id) => (
             <Input
               id={id}
               value={modelId}
               onChange={(e) => setModelId(e.target.value)}
               className="font-mono"
-              placeholder="claude-opus-5-5"
+              placeholder={agent === "codex" ? undefined : "claude-opus-5-5"}
               autoComplete="off"
               autoCapitalize="off"
               autoCorrect="off"
@@ -802,8 +869,8 @@ function SettingsForm({
           <p className="flex min-w-0 items-center gap-2 text-[12.5px] leading-snug text-ink-3">
             {me && <Avatar user={me.user} size={18} />}
             {agents.operator
-              ? `Saving runs them on your Claude subscription, instead of ${agents.operator.name}'s.`
-              : "Saving runs them on your Claude subscription."}
+              ? `Saving runs them on your ${planName(agent)}, instead of ${agents.operator.name}'s.`
+              : `Saving runs them on your ${planName(agent)}.`}
           </p>
         )}
         <div className="flex flex-wrap items-center justify-between gap-3">
@@ -944,7 +1011,7 @@ function AskForReview({
       open={open}
       onClose={onClose}
       title="Review a pull request"
-      description={`A review agent reviews its newest commit now${operator ? `, on ${operator}'s Claude subscription` : ""}, in place of a review of it still under way.`}
+      description={`A review agent reviews its newest commit now${operator ? `, on ${operator}'s ${planName(agents.agent_kind)}` : ""}, in place of a review of it still under way.`}
     >
       <form
         onSubmit={(e) => {
@@ -1036,12 +1103,12 @@ function ReviewRow({ r }: { r: G.Review }) {
               {agoShort(r.created_at)}
             </time>
             <span className="flex max-sm:hidden">
-              <Avatar user={r.operator} size={18} title={`On ${r.operator.name}'s Claude subscription`} />
+              <Avatar user={r.operator} size={18} title={`On ${r.operator.name}'s subscription`} />
             </span>
           </span>
         </Link>
         <span className="sr-only">
-          Started {ago(r.created_at)}, on {r.operator.name}'s Claude subscription.
+          Started {ago(r.created_at)}, on {r.operator.name}'s subscription.
         </span>
         <Meta
           parts={[

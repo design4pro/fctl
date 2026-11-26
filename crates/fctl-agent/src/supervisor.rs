@@ -4,9 +4,12 @@
 //! work (cloning, git state), and a clock. Outputs: journaled events, state
 //! and ephemeral streams to the host, and stdin for Claude.
 
+mod codex_runtime;
+
 use crate::attachments;
 use crate::caches;
 use crate::claude::{self, AskError, Claude, ClaudeOut, LaunchSpec};
+use crate::codex::{self, Codex};
 use crate::followed::Pulls;
 use crate::id_tokens;
 use crate::journal::Journal;
@@ -37,10 +40,12 @@ use fctl_proto::event::{
     PublishedFile,
 };
 use fctl_proto::runner::{
-    CLAUDE_STAND_IN, ClaudeCredential, ClaudeCredentialKind, CredentialKind, GitIdentity,
-    GithubCredential, MemorySpec, StopReason,
+    CLAUDE_STAND_IN, ClaudeCredential, ClaudeCredentialKind, CodexCredential, CredentialKind,
+    FEATURE_CODEX, GitIdentity, GithubCredential, MemorySpec, StopReason,
 };
-use fctl_proto::session::{GithubAccess, ProjectSettings, RemoteControlState, SessionStatus};
+use fctl_proto::session::{
+    AgentKind, GithubAccess, ProjectSettings, RemoteControlState, SessionStatus,
+};
 use fctl_proto::uplink::{
     AgentEvent, ContextWindow, Delivery, DeliveryKind, FEATURE_ATTACHMENTS, FEATURE_SETTINGS,
     SessionState,
@@ -76,6 +81,12 @@ fn now_ms() -> i64 {
 #[derive(Default, Serialize, Deserialize)]
 struct Persisted {
     claude_started: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    agent_kind: Option<AgentKind>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    codex_thread: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    codex_limit: Option<CodexLimit>,
     delivered: VecDeque<String>,
     remote_control_url: Option<String>,
     /// The title and description the agent gave the session (`fctl edit`).
@@ -127,6 +138,14 @@ struct Persisted {
     memory_md: Option<String>,
 }
 
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct CodexLimit {
+    run_id: Option<String>,
+    reset_at: Option<i64>,
+    #[serde(default)]
+    resume_work: bool,
+}
+
 /// A turn of Claude's that a supervisor before this one didn't see to its
 /// end ([`Supervisor::take_over`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -160,6 +179,7 @@ const REVIEW_POSTED: &str = "Finished: its review is posted";
 
 pub(crate) enum Work {
     Prepared(Result<(), String>),
+    Codex(u64, codex::Output),
     /// A snapshot was restored as the workspace was prepared, or why not,
     /// with the snapshot as the spec named it.
     Restored(
@@ -220,6 +240,14 @@ pub struct Supervisor {
     paths: Option<Paths>,
     state: SessionState,
     claude: Option<Claude>,
+    codex: Option<Codex>,
+    codex_generation: u64,
+    codex_credential: Option<CodexCredential>,
+    codex_auth_paused: bool,
+    codex_credential_rejected: bool,
+    codex_refresh_after: i64,
+    codex_refresh: Option<(String, i64)>,
+    codex_deferred_start: Option<(bool, bool)>,
     claude_tx: mpsc::UnboundedSender<ClaudeOut>,
     work_tx: mpsc::UnboundedSender<Work>,
     /// Messages that arrived before Claude was ready.
@@ -375,6 +403,14 @@ impl Supervisor {
                 },
                 persisted,
                 claude: None,
+                codex: None,
+                codex_generation: 0,
+                codex_credential: None,
+                codex_auth_paused: false,
+                codex_credential_rejected: false,
+                codex_refresh_after: 0,
+                codex_refresh: None,
+                codex_deferred_start: None,
                 claude_tx,
                 work_tx,
                 queue: VecDeque::new(),
@@ -498,6 +534,7 @@ impl Supervisor {
 
     fn hello(&self) -> AgentToHost {
         AgentToHost::Hello(AgentHello {
+            agent_kind: self.persisted.agent_kind,
             protocol: PROTOCOL_VERSION,
             version: VERSION.to_owned(),
             configured: self.config.is_some(),
@@ -508,6 +545,7 @@ impl Supervisor {
                 FEATURE_ATTACHMENTS,
                 FEATURE_SETTINGS,
                 FEATURE_AGENT_SNAPSHOTS,
+                FEATURE_CODEX,
             ]
             .into_iter()
             // Where the host's channels can come in.
@@ -614,11 +652,27 @@ impl Supervisor {
             HostToAgent::Credentials {
                 request_id,
                 claude,
+                codex,
                 github,
                 github_read,
                 error,
             } => {
+                self.on_codex_credentials(request_id.as_deref(), codex)
+                    .await;
                 self.on_credentials(request_id, claude, github, github_read, error);
+            }
+            HostToAgent::PauseCodex { reset_at } => {
+                if self.is_codex() {
+                    self.pause_codex_limit(reset_at, false);
+                }
+            }
+            HostToAgent::ResumeCodex => {
+                if let Some(limit) = &mut self.persisted.codex_limit {
+                    let now = now_ms();
+                    limit.reset_at = Some(now);
+                    self.resume_at = Some(now);
+                    self.persist();
+                }
             }
             HostToAgent::Stop { reason, grace_ms } => {
                 self.begin_stop(stop_text(reason).to_owned(), grace_ms)
@@ -1192,6 +1246,9 @@ impl Supervisor {
     /// gave it. Without it Claude can't reach the Anthropic API, and
     /// doesn't start ([`Self::start_claude`]).
     fn start_relay(&mut self, config: &AgentConfig) {
+        if config.spec.agent_kind == Some(AgentKind::Codex) {
+            return;
+        }
         let Some(want) = &config.claude_relay else {
             return;
         };
@@ -1268,17 +1325,46 @@ impl Supervisor {
         config.workdir = workdir.display().to_string();
         let paths = Paths::new(&workdir, &home, &self.user_state);
         self.state.branch = Some(config.spec.branch.clone());
-        self.state.claude_session_id = Some(config.spec.claude_session_id.clone());
+        let codex = config.spec.agent_kind == Some(AgentKind::Codex);
+        if (self.is_codex() && !codex) || (self.persisted.claude_started && codex) {
+            let _ = self.work_tx.send(Work::Prepared(Err(
+                "The sandbox belongs to a different agent kind".into(),
+            )));
+            return;
+        }
+        let kind = codex.then_some(AgentKind::Codex);
+        let changed_run = self
+            .persisted
+            .codex_limit
+            .as_ref()
+            .is_some_and(|limit| limit.run_id != config.spec.run_id);
+        if self.persisted.agent_kind != kind || changed_run {
+            self.persisted.agent_kind = kind;
+            if changed_run {
+                self.persisted.codex_limit = None;
+            }
+            self.persist();
+        }
+        self.state.claude_session_id = (!codex).then(|| config.spec.claude_session_id.clone());
         let creds = &config.spec.credentials;
         if let Some(at) = expiry(creds.github.as_ref(), creds.github_read.as_ref()) {
             self.github_expires_at = at;
         }
-        if config.claude_relay.is_some() {
-            // The host keeps the token: Claude never gets anything else.
-            config.spec.credentials.claude.access_token = CLAUDE_STAND_IN.to_owned();
-            self.start_relay(&config);
+        if codex {
+            self.codex_credential = config.spec.credentials.codex.take();
+            config.spec.credentials.claude = None;
+        } else {
+            if config.claude_relay.is_some() {
+                // The host keeps the token: Claude never gets anything else.
+                if let Some(credential) = &mut config.spec.credentials.claude {
+                    credential.access_token = CLAUDE_STAND_IN.to_owned();
+                }
+                self.start_relay(&config);
+            }
+            self.claude_credential
+                .clone_from(&config.spec.credentials.claude);
+            config.spec.credentials.codex = None;
         }
-        self.claude_credential = Some(config.spec.credentials.claude.clone());
         self.paths = Some(paths.clone());
         for (att, data) in std::mem::take(&mut self.pending_files) {
             self.save_file(&paths.attachments, &att, &data);
@@ -1447,6 +1533,10 @@ impl Supervisor {
 
     async fn on_work(&mut self, w: Work) {
         match w {
+            Work::Codex(generation, output) if generation == self.codex_generation => {
+                self.on_codex(output).await;
+            }
+            Work::Codex(_, _) => {}
             Work::Log(level, text, source) => self.log(source, level, &text),
             Work::ClaudeConnection(id) => match (&self.host, &self.relay) {
                 (Some(_), _) => self.send(&AgentToHost::ClaudeConnection { id }),
@@ -1454,14 +1544,21 @@ impl Supervisor {
                 (None, Some((relay, _))) => relay.refuse(&id),
                 (None, None) => {}
             },
-            Work::Prepared(Ok(())) => {
-                if let Err(e) = self.start_claude().await {
-                    let msg = format!("Claude could not start: {e:#}");
-                    self.notice(NoticeLevel::Error, "claude_start_failed", &msg, None);
+            Work::Prepared(Ok(())) if self.stopping.is_none() => {
+                if let Err(e) = self.start_agent().await {
+                    let name = self.agent_name();
+                    let msg = format!("{name} could not start: {e:#}");
+                    let code = if self.is_codex() {
+                        "codex_start_failed"
+                    } else {
+                        "claude_start_failed"
+                    };
+                    self.notice(NoticeLevel::Error, code, &msg, None);
                     self.set_status(SessionStatus::Failed, Some(msg));
                     self.finish().await;
                 }
             }
+            Work::Prepared(Ok(())) => {}
             Work::Restored(Ok(done), r) => self.on_restored(&done, &r),
             Work::Restored(Err(why), _) => self.notice(
                 NoticeLevel::Warn,
@@ -1617,6 +1714,228 @@ impl Supervisor {
         });
     }
 
+    fn is_codex(&self) -> bool {
+        self.persisted.agent_kind == Some(AgentKind::Codex)
+    }
+
+    fn agent_name(&self) -> &'static str {
+        if self.is_codex() { "Codex" } else { "Claude" }
+    }
+
+    fn agent_ready(&self) -> bool {
+        self.claude.is_some() || self.codex.is_some()
+    }
+
+    fn interrupt_turn(&mut self) {
+        if let Some(c) = self.claude.as_mut() {
+            c.request_nowait(json!({ "subtype": "interrupt" }));
+        }
+        if let Some(c) = self.codex.as_mut() {
+            c.interrupt();
+        }
+    }
+
+    async fn start_agent(&mut self) -> Result<()> {
+        if self.is_codex() {
+            self.start_codex().await
+        } else {
+            self.start_claude().await
+        }
+    }
+
+    async fn agent_instructions(
+        &mut self,
+        config: &AgentConfig,
+        paths: &Paths,
+        resume: bool,
+    ) -> Result<(Option<String>, bool)> {
+        let spec = &config.spec;
+        // Whether the agent keeps the project's memory: then Claude Code's
+        // own, which would last only as long as the sandbox, is off.
+        let mut keeps_memory = false;
+        let mut instructions = None;
+        if spec.review.is_some() {
+            // A review agent posts what it found through fctl, which named
+            // its session: without `fctl review` its work would be lost.
+            if self.session_socket.is_none() || !fctl_can(paths, "review submit").await {
+                anyhow::bail!(
+                    "this sandbox's fctl can't post reviews (`fctl review`), so the review agent couldn't post what it finds. The default image, ghcr.io/hyperstructure/sandbox, can; an image of your own needs a recent fctl on the PATH."
+                );
+            }
+            instructions = Some(prompt::REVIEW_AGENTS_MD.to_owned());
+        } else if self.session_socket.is_some() && fctl_can(paths, "edit").await {
+            // Publishing needs the project's consent and an fctl that can.
+            let screenshots =
+                spec.project.settings.publish_screenshots && fctl_can(paths, "publish").await;
+            let days = screenshots.then(|| published::days(&spec.project.settings));
+            // So do the memory and retrospectives. A conversation that
+            // resumes with the memory it started with needs no new look:
+            // this sandbox's fctl kept it then, and a look that fails once
+            // (its time out) would cost Claude the whole file again.
+            let kept = self
+                .persisted
+                .memory_md
+                .clone()
+                .filter(|_| resume && spec.memory.is_some());
+            let memory = match &spec.memory {
+                Some(m) if kept.is_some() || fctl_can(paths, "memory").await => Some(m),
+                _ => None,
+            };
+            let memory_md = memory_section(memory, kept.as_deref(), resume, now_ms());
+            if self.persisted.memory_md != memory_md {
+                self.persisted.memory_md.clone_from(&memory_md);
+                self.persist();
+            }
+            let retrospectives = spec.retrospectives && fctl_can(paths, "retro").await;
+            // Agents keep one for each piece of work where their fctl
+            // updates them.
+            let update_retrospectives = retrospectives && fctl_can(paths, "retro update").await;
+            let lacking = (spec.memory.is_some() && memory.is_none())
+                || (spec.retrospectives && !retrospectives);
+            if lacking && !self.told_old_fctl {
+                self.told_old_fctl = true;
+                self.log(
+                    LogSource::Agent,
+                    LogLevel::Info,
+                    "This sandbox's fctl has no `fctl memory` or `fctl retro`, so the agent keeps no project memory and records no retrospectives. The default image, ghcr.io/hyperstructure/sandbox, has them; an image of your own needs a recent fctl on the PATH.",
+                );
+            }
+            keeps_memory = memory.is_some();
+            // An agent that comments resolves review threads through fctl.
+            let review_threads = spec.github_access == Some(GithubAccess::Comment)
+                && fctl_can(paths, "resolve").await;
+            // Identity tokens, where the project lets its agents mint them
+            // and the sandbox's fctl can.
+            let id_tokens = match &spec.id_tokens {
+                Some(t) if fctl_can(paths, "id-token").await => Some(t),
+                _ => None,
+            };
+            let extras = prompt::Extras {
+                screenshot_days: days,
+                memory: memory_md.as_deref(),
+                retrospectives,
+                update_retrospectives,
+                review_threads,
+                autopilot: spec.autopilot.is_some(),
+                // Through this agent and its host, which carry files.
+                autopilot_files: spec.autopilot.is_some() && fctl_can(paths, "files").await,
+                id_tokens,
+            };
+            instructions = Some(prompt::agents_md(&extras));
+        } else if !self.told_no_fctl {
+            self.told_no_fctl = true;
+            self.log(
+                LogSource::Agent,
+                LogLevel::Info,
+                "This sandbox has no fctl that can rename the session, so it keeps the title it started with. The default image, ghcr.io/hyperstructure/sandbox, has one; an image of your own needs fctl on the PATH.",
+            );
+        }
+        Ok((instructions, keeps_memory))
+    }
+
+    fn agent_environment(
+        &self,
+        config: &AgentConfig,
+    ) -> std::collections::BTreeMap<String, String> {
+        let spec = &config.spec;
+        let project_env = fctl_domain::settings::session_env(&spec.project.settings);
+        let mut env = std::collections::BTreeMap::new();
+        let cache_env = self
+            .cache
+            .iter()
+            .flat_map(|c| c.env.iter().map(|(k, v)| (k, v)));
+        // The clouds' variables, which the project's own come after.
+        let cloud_env = self
+            .cloud_tokens
+            .as_ref()
+            .map(|t| t.env(&spec.project.slug, spec.number))
+            .unwrap_or_default();
+        for (k, v) in cache_env
+            .chain(cloud_env.iter().map(|(k, v)| (k, v)))
+            .chain(project_env.iter())
+            .chain(spec.secrets.iter())
+            .chain(config.env.iter())
+        {
+            env.insert(k.clone(), v.clone());
+        }
+        env.insert("GIT_TERMINAL_PROMPT".into(), "0".into());
+        env.insert("FCTL_SESSION_ID".into(), spec.session_id.0.clone());
+        env.insert("FCTL_SESSION_URL".into(), spec.web_url.clone());
+        // An autopilot's own session: its `fctl` reaches the API through
+        // this agent (`AgentCall::Api`), as the autopilot of this project.
+        if let Some(a) = &spec.autopilot {
+            env.insert(AUTOPILOT_ENV.into(), a.project_slug.clone());
+        }
+        if let Some(socket) = &self.session_socket {
+            env.insert(SESSION_SOCKET_ENV.into(), socket.display().to_string());
+        }
+        env.extend(prompt::sandbox_env(config.sandbox));
+        env
+    }
+
+    async fn agent_system(&mut self, config: &AgentConfig, paths: &Paths) -> String {
+        let spec = &config.spec;
+        let workdir = config.workdir.as_str();
+        // `fctl ticket` reaches the tracker, where the sandbox's fctl has it.
+        let tickets_cli = match spec.tickets.as_ref() {
+            Some(t) if t.via == fctl_proto::tickets::TicketsVia::Fctl => {
+                let can = self.session_socket.is_some() && fctl_can(paths, "ticket").await;
+                if !can && !self.told_old_fctl_tickets {
+                    self.told_old_fctl_tickets = true;
+                    self.log(
+                        LogSource::Agent,
+                        LogLevel::Info,
+                        "This sandbox's fctl has no `fctl ticket`, so the agent can't reach the project's ticket tracker. The default image, ghcr.io/hyperstructure/sandbox, has it; an image of your own needs a recent fctl on the PATH.",
+                    );
+                }
+                can
+            }
+            _ => false,
+        };
+        // `fctl ask` asks people, where the sandbox's fctl has it, and an
+        // autopilot asks with `fctl autopilot ask`.
+        let asks_cli =
+            spec.review.is_none() && self.session_socket.is_some() && fctl_can(paths, "ask").await;
+        let autopilot_cli = spec.autopilot.is_some()
+            && self.session_socket.is_some()
+            && fctl_can(paths, "autopilot").await;
+        if spec.autopilot.is_some() && !autopilot_cli && !self.told_old_fctl_autopilot {
+            self.told_old_fctl_autopilot = true;
+            self.log(
+                LogSource::Agent,
+                LogLevel::Info,
+                "This sandbox's fctl has no `fctl autopilot`, so the autopilot can't reach fctl from it. The default image, ghcr.io/hyperstructure/sandbox, has it; an image of your own needs a recent fctl on the PATH.",
+            );
+        }
+        match &spec.review {
+            Some(review) => {
+                let previous_here = match review.previous_sha.as_deref() {
+                    Some(sha) => workspace::has_commit(&paths.workdir, &paths.home, sha).await,
+                    None => false,
+                };
+                prompt::review_system_prompt(
+                    spec,
+                    review,
+                    workdir,
+                    &workspace::review_branch(spec, review),
+                    previous_here,
+                    paths,
+                    config.sandbox,
+                )
+            }
+            None => prompt::system_prompt(
+                spec,
+                workdir,
+                paths,
+                config.sandbox,
+                self.cache.as_ref(),
+                tickets_cli,
+                asks_cli,
+                autopilot_cli,
+            ),
+        }
+    }
+
     // ───────────────────────────── Claude ─────────────────────────────
 
     fn write_claude_config(
@@ -1704,88 +2023,11 @@ impl Supervisor {
             && (self.persisted.claude_started
                 || claude::conversation_exists(&paths.home, &spec.claude_session_id));
         let fresh_resume = wants_resume && !resume;
-        // Whether the agent keeps the project's memory: then Claude Code's
-        // own, which would last only as long as the sandbox, is off.
-        let mut keeps_memory = false;
-        if spec.review.is_some() {
-            // A review agent posts what it found through fctl, which named
-            // its session: without `fctl review` its work would be lost.
-            if self.session_socket.is_none() || !fctl_can(&paths, "review submit").await {
-                anyhow::bail!(
-                    "this sandbox's fctl can't post reviews (`fctl review`), so the review agent couldn't post what it finds. The default image, ghcr.io/hyperstructure/sandbox, can; an image of your own needs a recent fctl on the PATH."
-                );
-            }
-            if let Err(e) = claude::write_instructions(&paths.home, prompt::REVIEW_AGENTS_MD) {
-                tracing::warn!("writing ~/AGENTS.md failed: {e:#}");
-            }
-        } else if self.session_socket.is_some() && fctl_can(&paths, "edit").await {
-            // Publishing needs the project's consent and an fctl that can.
-            let screenshots =
-                spec.project.settings.publish_screenshots && fctl_can(&paths, "publish").await;
-            let days = screenshots.then(|| published::days(&spec.project.settings));
-            // So do the memory and retrospectives. A conversation that
-            // resumes with the memory it started with needs no new look:
-            // this sandbox's fctl kept it then, and a look that fails once
-            // (its time out) would cost Claude the whole file again.
-            let kept = self
-                .persisted
-                .memory_md
-                .clone()
-                .filter(|_| resume && spec.memory.is_some());
-            let memory = match &spec.memory {
-                Some(m) if kept.is_some() || fctl_can(&paths, "memory").await => Some(m),
-                _ => None,
-            };
-            let memory_md = memory_section(memory, kept.as_deref(), resume, now_ms());
-            if self.persisted.memory_md != memory_md {
-                self.persisted.memory_md.clone_from(&memory_md);
-                self.persist();
-            }
-            let retrospectives = spec.retrospectives && fctl_can(&paths, "retro").await;
-            // Agents keep one for each piece of work where their fctl
-            // updates them.
-            let update_retrospectives = retrospectives && fctl_can(&paths, "retro update").await;
-            let lacking = (spec.memory.is_some() && memory.is_none())
-                || (spec.retrospectives && !retrospectives);
-            if lacking && !self.told_old_fctl {
-                self.told_old_fctl = true;
-                self.log(
-                    LogSource::Agent,
-                    LogLevel::Info,
-                    "This sandbox's fctl has no `fctl memory` or `fctl retro`, so the agent keeps no project memory and records no retrospectives. The default image, ghcr.io/hyperstructure/sandbox, has them; an image of your own needs a recent fctl on the PATH.",
-                );
-            }
-            keeps_memory = memory.is_some();
-            // An agent that comments resolves review threads through fctl.
-            let review_threads = spec.github_access == Some(GithubAccess::Comment)
-                && fctl_can(&paths, "resolve").await;
-            // Identity tokens, where the project lets its agents mint them
-            // and the sandbox's fctl can.
-            let id_tokens = match &spec.id_tokens {
-                Some(t) if fctl_can(&paths, "id-token").await => Some(t),
-                _ => None,
-            };
-            let extras = prompt::Extras {
-                screenshot_days: days,
-                memory: memory_md.as_deref(),
-                retrospectives,
-                update_retrospectives,
-                review_threads,
-                autopilot: spec.autopilot.is_some(),
-                // Through this agent and its host, which carry files.
-                autopilot_files: spec.autopilot.is_some() && fctl_can(&paths, "files").await,
-                id_tokens,
-            };
-            if let Err(e) = claude::write_instructions(&paths.home, &prompt::agents_md(&extras)) {
-                tracing::warn!("writing ~/AGENTS.md failed: {e:#}");
-            }
-        } else if !self.told_no_fctl {
-            self.told_no_fctl = true;
-            self.log(
-                LogSource::Agent,
-                LogLevel::Info,
-                "This sandbox has no fctl that can rename the session, so it keeps the title it started with. The default image, ghcr.io/hyperstructure/sandbox, has one; an image of your own needs fctl on the PATH.",
-            );
+        let (instructions, keeps_memory) = self.agent_instructions(&config, &paths, resume).await?;
+        if let Some(instructions) = instructions
+            && let Err(e) = claude::write_instructions(&paths.home, &instructions)
+        {
+            tracing::warn!("writing ~/AGENTS.md failed: {e:#}");
         }
         // A review's working directory holds the pull request's head, which
         // anyone may have written: its Claude settings (hooks, a status
@@ -1810,27 +2052,9 @@ impl Supervisor {
         let cred = self
             .claude_credential
             .clone()
-            .unwrap_or_else(|| spec.credentials.claude.clone());
-        let project_env = fctl_domain::settings::session_env(&spec.project.settings);
-        let mut env = std::collections::BTreeMap::new();
-        let cache_env = self
-            .cache
-            .iter()
-            .flat_map(|c| c.env.iter().map(|(k, v)| (k, v)));
-        // The clouds' variables, which the project's own come after.
-        let cloud_env = self
-            .cloud_tokens
-            .as_ref()
-            .map(|t| t.env(&spec.project.slug, spec.number))
-            .unwrap_or_default();
-        for (k, v) in cache_env
-            .chain(cloud_env.iter().map(|(k, v)| (k, v)))
-            .chain(project_env.iter())
-            .chain(spec.secrets.iter())
-            .chain(config.env.iter())
-        {
-            env.insert(k.clone(), v.clone());
-        }
+            .or_else(|| spec.credentials.claude.clone())
+            .ok_or_else(|| anyhow::anyhow!("Claude credential is missing"))?;
+        let mut env = self.agent_environment(&config);
         env.insert("CLAUDE_CODE_OAUTH_TOKEN".into(), cred.access_token.clone());
         // Claude reaches the Anthropic API through the host, which puts the
         // token in: its proxy, the host's certificate authority, and the
@@ -1866,79 +2090,10 @@ impl Supervisor {
         env.insert("DISABLE_AUTOUPDATER".into(), "1".into());
         // Turns Claude starts on its own (for background work) count too.
         env.insert(tasks::SESSION_STATE_ENV.into(), "1".into());
-        env.insert("GIT_TERMINAL_PROMPT".into(), "0".into());
-        env.insert("FCTL_SESSION_ID".into(), spec.session_id.0.clone());
-        env.insert("FCTL_SESSION_URL".into(), spec.web_url.clone());
-        // An autopilot's own session: its `fctl` reaches the API through
-        // this agent (`AgentCall::Api`), as the autopilot of this project.
-        if let Some(a) = &spec.autopilot {
-            env.insert(AUTOPILOT_ENV.into(), a.project_slug.clone());
-        }
         if keeps_memory {
             env.insert(claude::DISABLE_AUTO_MEMORY_ENV.into(), "1".into());
         }
-        if let Some(socket) = &self.session_socket {
-            env.insert(SESSION_SOCKET_ENV.into(), socket.display().to_string());
-        }
-        env.extend(prompt::sandbox_env(config.sandbox));
-        // `fctl ticket` reaches the tracker, where the sandbox's fctl has it.
-        let tickets_cli = match spec.tickets.as_ref() {
-            Some(t) if t.via == fctl_proto::tickets::TicketsVia::Fctl => {
-                let can = self.session_socket.is_some() && fctl_can(&paths, "ticket").await;
-                if !can && !self.told_old_fctl_tickets {
-                    self.told_old_fctl_tickets = true;
-                    self.log(
-                        LogSource::Agent,
-                        LogLevel::Info,
-                        "This sandbox's fctl has no `fctl ticket`, so the agent can't reach the project's ticket tracker. The default image, ghcr.io/hyperstructure/sandbox, has it; an image of your own needs a recent fctl on the PATH.",
-                    );
-                }
-                can
-            }
-            _ => false,
-        };
-        // `fctl ask` asks people, where the sandbox's fctl has it, and an
-        // autopilot asks with `fctl autopilot ask`.
-        let asks_cli =
-            spec.review.is_none() && self.session_socket.is_some() && fctl_can(&paths, "ask").await;
-        let autopilot_cli = spec.autopilot.is_some()
-            && self.session_socket.is_some()
-            && fctl_can(&paths, "autopilot").await;
-        if spec.autopilot.is_some() && !autopilot_cli && !self.told_old_fctl_autopilot {
-            self.told_old_fctl_autopilot = true;
-            self.log(
-                LogSource::Agent,
-                LogLevel::Info,
-                "This sandbox's fctl has no `fctl autopilot`, so the autopilot can't reach fctl from it. The default image, ghcr.io/hyperstructure/sandbox, has it; an image of your own needs a recent fctl on the PATH.",
-            );
-        }
-        let system = match &spec.review {
-            Some(review) => {
-                let previous_here = match review.previous_sha.as_deref() {
-                    Some(sha) => workspace::has_commit(&paths.workdir, &paths.home, sha).await,
-                    None => false,
-                };
-                prompt::review_system_prompt(
-                    spec,
-                    review,
-                    &workdir,
-                    &workspace::review_branch(spec, review),
-                    previous_here,
-                    &paths,
-                    config.sandbox,
-                )
-            }
-            None => prompt::system_prompt(
-                spec,
-                &workdir,
-                &paths,
-                config.sandbox,
-                self.cache.as_ref(),
-                tickets_cli,
-                asks_cli,
-                autopilot_cli,
-            ),
-        };
+        let system = self.agent_system(&config, &paths).await;
         let launch = LaunchSpec {
             bin: &bin,
             cwd: &paths.workdir,
@@ -2029,12 +2184,22 @@ impl Supervisor {
             self.emit(EventBody::RemoteControl(rc));
         }
         self.claude = Some(c);
+        self.initial_turns(spec, resume, fresh_resume).await;
+        Ok(())
+    }
+
+    async fn initial_turns(
+        &mut self,
+        spec: &fctl_proto::runner::SessionSpec,
+        resume: bool,
+        fresh_resume: bool,
+    ) {
         // The first turn, then anything that queued up meanwhile.
         if fresh_resume {
             self.log(
                 LogSource::Agent,
                 LogLevel::Info,
-                "The earlier conversation went with the old sandbox; Claude starts a new one on the branch",
+                &format!("The earlier conversation went with the old sandbox; {} starts a new one on the branch", self.agent_name()),
             );
             // The task's files came along again, into the new sandbox.
             let files = self.prepare_files(&spec.task_attachments);
@@ -2056,10 +2221,17 @@ impl Supervisor {
         } else {
             self.wait().await;
         }
-        while let Some(d) = self.queue.pop_front() {
-            self.on_delivery(d).await;
+        self.drain_deliveries().await;
+    }
+
+    async fn drain_deliveries(&mut self) {
+        while self.agent_ready()
+            && self.state.status != SessionStatus::Paused
+            && self.stopping.is_none()
+            && let Some(delivery) = self.queue.pop_front()
+        {
+            self.on_delivery(delivery).await;
         }
-        Ok(())
     }
 
     fn prepare_files(&self, files: &[Attachment]) -> attachments::Prepared {
@@ -2086,7 +2258,7 @@ impl Supervisor {
         images: Vec<Value>,
         delivery: Option<&DeliveryId>,
     ) {
-        if self.claude.is_none() {
+        if !self.agent_ready() {
             return;
         }
         // The first message after a stop that cut background work short.
@@ -2115,23 +2287,76 @@ impl Supervisor {
             let mut content = vec![json!({ "type": "text", "text": text })];
             content.extend(images);
             c.send_user(content, &fctl_domain::ids::uuid_v4());
-            self.turn_active = true;
-            self.cut_off_waits = false;
-            // A turn of Claude's own now has this message to answer too.
-            self.claude_turn = false;
-            self.idle_since = None;
-            if let Some(id) = delivery {
-                self.mark_delivered(id);
-                self.send(&AgentToHost::Delivered {
-                    delivery_id: id.clone(),
-                    ok: true,
-                    error: None,
-                });
-            }
-            if self.state.status != SessionStatus::Running {
-                self.set_status(SessionStatus::Running, None);
+        } else if let Some(c) = &mut self.codex {
+            let (model, effort) = self.config.as_ref().map_or((None, None), |config| {
+                (config.spec.model.as_deref(), config.spec.effort.as_deref())
+            });
+            match c
+                .send(
+                    &text,
+                    images,
+                    delivery.map(DeliveryId::as_str),
+                    model,
+                    effort,
+                )
+                .await
+            {
+                Ok(()) => {}
+                Err(e @ codex::RpcError::Refused { .. }) => {
+                    let why = e.to_string();
+                    if let Some(id) = delivery {
+                        self.refuse_delivery(id, why);
+                    } else {
+                        self.notice(NoticeLevel::Error, "codex_message_refused", &why, None);
+                    }
+                    return;
+                }
+                Err(e) => {
+                    self.notice(
+                        NoticeLevel::Warn,
+                        "codex_delivery_interrupted",
+                        &e.to_string(),
+                        None,
+                    );
+                    let _ = self
+                        .work_tx
+                        .send(Work::Codex(self.codex_generation, codex::Output::Exited));
+                    return;
+                }
             }
         }
+        self.turn_active = true;
+        self.cut_off_waits = false;
+        self.claude_turn = false;
+        self.idle_since = None;
+        if let Some(id) = delivery {
+            self.ack_delivery(id);
+        }
+        if self.state.status != SessionStatus::Running {
+            self.set_status(SessionStatus::Running, None);
+        }
+    }
+
+    fn ack_delivery(&mut self, id: &DeliveryId) {
+        self.mark_delivered(id);
+        self.send(&AgentToHost::Delivered {
+            delivery_id: id.clone(),
+            ok: true,
+            error: None,
+        });
+    }
+
+    fn refuse_delivery(&mut self, id: &DeliveryId, why: String) {
+        self.mark_delivered(id);
+        self.settings_refused.push_back((id.0.clone(), why.clone()));
+        if self.settings_refused.len() > REFUSALS_KEPT {
+            self.settings_refused.pop_front();
+        }
+        self.send(&AgentToHost::Delivered {
+            delivery_id: id.clone(),
+            ok: false,
+            error: Some(why),
+        });
     }
 
     async fn on_delivery(&mut self, d: Delivery) {
@@ -2164,13 +2389,18 @@ impl Supervisor {
                     // Leave it unconfirmed: the control plane keeps it for the next run.
                     return;
                 }
-                if self.claude.is_none() {
-                    self.queue.push_back(d.clone());
+                if self
+                    .codex
+                    .as_ref()
+                    .is_some_and(|c| c.was_delivered(d.id.as_str()))
+                {
+                    self.ack_delivery(&d.id);
                     return;
                 }
-                // A message during a usage-limit pause waits for the reset.
-                if self.state.status == SessionStatus::Paused {
-                    self.queue.push_back(d.clone());
+                if !self.agent_ready() || self.state.status == SessionStatus::Paused {
+                    if !self.queue.iter().any(|q| q.id == d.id) {
+                        self.queue.push_back(d);
+                    }
                     return;
                 }
                 let author = author.as_ref().map(|user| prompt::Author {
@@ -2186,6 +2416,10 @@ impl Supervisor {
                     self.queue.push_back(d.clone());
                     return;
                 };
+                if self.is_codex() {
+                    self.codex_settings(&d.id, model.as_ref(), effort.as_ref());
+                    return;
+                }
                 let before = (spec.model.clone(), spec.effort.clone());
                 // What Claude starts on if it starts again in this run.
                 if let Some(config) = self.config.as_mut() {
@@ -2243,19 +2477,12 @@ impl Supervisor {
                 });
             }
             DeliveryKind::Interrupt { .. } => {
-                if let Some(c) = self.claude.as_mut()
-                    && self.turn_active
-                {
-                    c.request_nowait(json!({ "subtype": "interrupt" }));
+                if self.turn_active {
+                    self.interrupt_turn();
                 }
                 self.queue
                     .retain(|q| !matches!(q.kind, DeliveryKind::Message { .. }));
-                self.mark_delivered(&d.id);
-                self.send(&AgentToHost::Delivered {
-                    delivery_id: d.id,
-                    ok: true,
-                    error: None,
-                });
+                self.ack_delivery(&d.id);
             }
         }
     }
@@ -2352,15 +2579,7 @@ impl Supervisor {
                 read_effort(c, &self.work_tx);
                 read_context(c, &self.work_tx);
             }
-            self.turn_active = more_queued;
-            self.claude_turn = false;
-            if !more_queued
-                && self.stopping.is_none()
-                && self.state.status == SessionStatus::Running
-            {
-                self.wait().await;
-            }
-            self.after_turn();
+            self.turn_finished(more_queued).await;
         } else if tasks_changed
             && !self.turn_active
             && self.stopping.is_none()
@@ -2368,6 +2587,15 @@ impl Supervisor {
         {
             self.wait().await;
         }
+    }
+
+    async fn turn_finished(&mut self, more_queued: bool) {
+        self.turn_active = more_queued;
+        self.claude_turn = false;
+        if !more_queued && self.stopping.is_none() && self.state.status == SessionStatus::Running {
+            self.wait().await;
+        }
+        self.after_turn();
     }
 
     /// The session waits: for Claude's background tasks while any run,
@@ -2668,7 +2896,8 @@ impl Supervisor {
         };
         if ran_on {
             tracing::warn!(
-                "stopped Claude (pid {}), or what it started, which the supervisor before this one left running",
+                "stopped {} (pid {}), or what it started, which the supervisor before this one left running",
+                self.agent_name(),
                 left.map_or(0, |c| c.pid)
             );
         }
@@ -2693,9 +2922,8 @@ impl Supervisor {
         }
     }
 
-    /// Says in the transcript that a turn of Claude's was cut off, and has
-    /// Claude carry on with it, unless it did so for another one shortly
-    /// before: then Claude waits for a message.
+    /// Reports a cut-off turn and resumes it unless the agent already
+    /// resumed a turn recently.
     async fn carry_on(&mut self, cut_off: CutOff) {
         // Said once: it was taken from the saved state.
         self.persist();
@@ -2704,22 +2932,35 @@ impl Supervisor {
             .persisted
             .carried_on_at
             .is_some_and(|at| now.saturating_sub(at) < CARRY_ON_AGAIN_AFTER.as_millis() as i64);
+        let name = self.agent_name();
         let what = match cut_off {
-            CutOff::Unseen => {
-                "fctl-agent restarted in the sandbox while Claude worked, so Claude's last steps aren't shown here, and fctl stopped that Claude to start it again on the conversation.".to_owned()
-            }
-            CutOff::Stopped => {
-                "Claude's turn was cut off: fctl-agent stopped in the sandbox while Claude worked.".to_owned()
-            }
+            CutOff::Unseen => format!(
+                "fctl-agent restarted in the sandbox while {name} worked, so {name}'s last steps aren't shown here, and fctl stopped that {name} to start it again on the conversation."
+            ),
+            CutOff::Stopped => format!(
+                "{name}'s turn was cut off: fctl-agent stopped in the sandbox while {name} worked."
+            ),
             CutOff::Exited(exit) => format!(
-                "Claude's turn was cut off: Claude Code {} while it worked.",
+                "{}'s turn was cut off: {} {} while it worked.",
+                self.agent_name(),
+                if self.is_codex() {
+                    "Codex"
+                } else {
+                    "Claude Code"
+                },
                 exit.words()
             ),
         };
         let then = if again {
-            "It was cut off shortly before too, so Claude waits for a message."
+            format!(
+                "It was cut off shortly before too, so {} waits for a message.",
+                self.agent_name()
+            )
         } else {
-            "Claude carries on with the turn, from where it left off."
+            format!(
+                "{} carries on with the turn, from where it left off.",
+                self.agent_name()
+            )
         };
         self.notice(
             NoticeLevel::Warn,
@@ -2739,6 +2980,11 @@ impl Supervisor {
             CutOff::Exited(exit) => prompt::CutOffBy::Exit(exit),
         };
         let text = prompt::cut_off_turn(why);
+        let text = if self.is_codex() {
+            text.replace("Claude Code", "Codex")
+        } else {
+            text
+        };
         self.send_turn(&text, None, None, &[]).await;
     }
 
@@ -2830,7 +3076,7 @@ impl Supervisor {
     /// Whether what fctl-agent tells Claude now reaches it at its next
     /// step: it is on a turn, which no stop or usage limit holds up.
     fn claude_listens(&self) -> bool {
-        self.claude.is_some()
+        self.agent_ready()
             && self.turn_active
             && self.stopping.is_none()
             && self.state.status == SessionStatus::Running
@@ -2840,7 +3086,7 @@ impl Supervisor {
     /// ten seconds, and while it works, the sandbox's memory use, every
     /// five ([`oom`]).
     async fn watch_memory(&mut self, now: Instant) {
-        if self.claude.is_none() {
+        if !self.agent_ready() {
             return;
         }
         if let Some(new) = self.oom_kills.tick(now, oom::kills) {
@@ -2892,12 +3138,17 @@ impl Supervisor {
             format!(", most of it by {largest}")
         };
         let msg = format!(
-            "The sandbox's memory is {}% full ({} in use){most}: fctl-agent asked Claude to stop what it no longer needs.",
+            "The sandbox's memory is {}% full ({} in use){most}: fctl-agent asked {} to stop what it no longer needs.",
             usage.percent(),
-            usage.words()
+            usage.words(),
+            self.agent_name()
         );
         self.notice(NoticeLevel::Warn, "memory_nearly_out", &msg, None);
-        let claude = self.claude.as_ref().and_then(Claude::pid);
+        let claude = self
+            .claude
+            .as_ref()
+            .and_then(Claude::pid)
+            .or_else(|| self.codex.as_ref().and_then(Codex::pid));
         let listed = &processes[..processes.len().min(oom::LISTED)];
         let text = prompt::memory_nearly_out(usage, listed, claude);
         self.send_turn(&text, None, None, &[]).await;
@@ -2912,7 +3163,11 @@ impl Supervisor {
         if !self.watches_memory() {
             return;
         }
-        let claude = self.claude.as_ref().and_then(Claude::pid);
+        let claude = self
+            .claude
+            .as_ref()
+            .and_then(Claude::pid)
+            .or_else(|| self.codex.as_ref().and_then(Codex::pid));
         let claude_killed = claude
             .is_none_or(|pid| !oom::alive(pid) || kills.named.iter().any(|k| k.pid == Some(pid)));
         if claude_killed {
@@ -2952,7 +3207,7 @@ impl Supervisor {
             || !waited
             || !self.nothing_runs()
             || self.stopping.is_some()
-            || self.claude.is_none()
+            || !self.agent_ready()
         {
             return;
         }
@@ -2989,22 +3244,28 @@ impl Supervisor {
         self.sync();
         self.remind_reviewer().await;
         self.stop_reviewed().await;
+        self.check_codex_credentials(now);
         // Usage limit reset: continue.
-        if self.state.status == SessionStatus::Paused && self.resume_at.is_some_and(|t| now >= t) {
+        if self.state.status == SessionStatus::Paused
+            && self.resume_at.is_some_and(|t| now >= t)
+            && (!self.is_codex() || (self.codex.is_some() && !self.turn_active))
+        {
             self.resume_at = None;
-            self.set_status(
-                SessionStatus::Running,
-                Some("Resuming after the usage limit reset".into()),
-            );
-            self.send_turn(
-                "The usage limit has reset. Continue where you left off.",
-                None,
-                None,
-                &[],
-            )
-            .await;
-            while let Some(d) = self.queue.pop_front() {
-                self.on_delivery(d).await;
+            if self.is_codex() {
+                self.reset_codex_limit().await;
+            } else {
+                self.set_status(
+                    SessionStatus::Running,
+                    Some("Resuming after the usage limit reset".into()),
+                );
+                self.send_turn(
+                    "The usage limit has reset. Continue where you left off.",
+                    None,
+                    None,
+                    &[],
+                )
+                .await;
+                self.drain_deliveries().await;
             }
         }
         // The clouds' tokens last ten minutes; each is minted again five
@@ -3061,10 +3322,17 @@ impl Supervisor {
         let spec = &config.spec;
         let snap = spec.snapshot.as_ref()?;
         let r = snap.restore.clone()?;
-        if self.persisted.claude_started
-            || claude::conversation_exists(home, &spec.claude_session_id)
-            || !(r.conversation || r.changes)
-        {
+        let conversation_here = if self.is_codex() {
+            let history = codex::history_home(home, spec.session_id.as_str());
+            self.persisted
+                .codex_thread
+                .as_deref()
+                .is_some_and(|id| codex::rollout(&history, id).is_some())
+        } else {
+            self.persisted.claude_started
+                || claude::conversation_exists(home, &spec.claude_session_id)
+        };
+        if conversation_here || !(r.conversation || r.changes) {
             return None;
         }
         if config.first_agent_seq.unwrap_or(0) > r.agent_seq {
@@ -3157,6 +3425,10 @@ impl Supervisor {
         done: &crate::snapshot::Restored,
         r: &fctl_proto::runner::SnapshotRef,
     ) {
+        if let Some(thread) = &done.codex_thread {
+            self.persisted.codex_thread = Some(thread.clone());
+            self.persist();
+        }
         let text = fctl_domain::snapshots::restored_words(
             done.conversation,
             !done.changes.is_empty(),
@@ -3222,23 +3494,29 @@ impl Supervisor {
         let Some(snap) = config.spec.snapshot.as_ref().filter(|s| s.save) else {
             return;
         };
-        // Claude never ran here: nothing of this run's to keep.
-        if !self.persisted.claude_started {
-            return;
-        }
+        let version = self.claude_version.map(|v| v.to_string());
+        let thread = self.persisted.codex_thread.clone();
+        let history = if self.is_codex() {
+            let Some(id) = &thread else { return };
+            crate::snapshot::History::Codex(id)
+        } else {
+            if !self.persisted.claude_started {
+                return;
+            }
+            crate::snapshot::History::Claude(version.as_deref())
+        };
         let Ok(key) = STANDARD.decode(snap.key.as_bytes()) else {
             return;
         };
         // Where the session's user writes, as for a restore.
         let dir = self.user_state.join("snapshot");
-        let version = self.claude_version.map(|v| v.to_string());
         let seq = self.journal.last_seq();
         match crate::snapshot::save(
             &paths,
             &config.spec,
             &key,
             snap.max_bytes,
-            version.as_deref(),
+            history,
             seq,
             &dir,
         )
@@ -3308,9 +3586,7 @@ impl Supervisor {
         self.stopping = Some((why.clone(), deadline));
         self.set_status(SessionStatus::Stopping, Some(why));
         if self.turn_active {
-            if let Some(c) = self.claude.as_mut() {
-                c.request_nowait(json!({ "subtype": "interrupt" }));
-            }
+            self.interrupt_turn();
         } else {
             self.finish().await;
         }
@@ -3336,6 +3612,12 @@ impl Supervisor {
         }
         if let Some(mut c) = self.claude.take() {
             c.kill().await;
+        }
+        if let Some(mut c) = self.codex.take() {
+            c.stop().await;
+            if let Some(group) = self.persisted.claude {
+                group.stop(Duration::from_secs(5)).await;
+            }
         }
         // A session stopped or failed doesn't carry on with a turn cut off
         // before.
@@ -3443,11 +3725,15 @@ async fn restore_snapshot(
     };
     let result = match file {
         Ok(path) => {
-            let version = claude::check_version(&r.claude_bin)
-                .await
-                .ok()
-                .flatten()
-                .map(|v| v.to_string());
+            let version = if spec.agent_kind == Some(AgentKind::Codex) {
+                None
+            } else {
+                claude::check_version(&r.claude_bin)
+                    .await
+                    .ok()
+                    .flatten()
+                    .map(|v| v.to_string())
+            };
             let out = crate::snapshot::restore(
                 paths,
                 spec,

@@ -62,6 +62,31 @@ const project = (
 ) => ({ settings: settings as G.ProjectSettings, ...last });
 
 describe("the composer's model and effort", () => {
+  it("uses Codex defaults and ignores the Claude choice saved for the project", () => {
+    const p = project(
+      {
+        agent_kind: "codex",
+        model: "opus",
+        effort: "high",
+        codex_model: "gpt-codex",
+        codex_effort: "minimal",
+      },
+      { last_model: "sonnet", last_effort: "max" },
+    );
+    expect(startChoice(p)).toEqual({
+      agent_kind: "codex",
+      model: "gpt-codex",
+      effort: "minimal",
+      github: "push",
+    });
+    expect(modelOffers(p, "gpt-codex").map((m) => m.value)).toEqual(["gpt-codex"]);
+    expect(effortOffers(p, "minimal").map((e) => e.value)).toContain("minimal");
+    expect(asked(p, startChoice(p))).toEqual({});
+    const claude = startChoice(p, { agent_kind: "claude", effort: "low" });
+    expect(claude.model).toBe("opus");
+    expect(asked(p, claude)).toEqual({ agent_kind: "claude", effort: "low" });
+  });
+
   it("starts on what you last asked for in the project, else on the project's", () => {
     expect(startChoice(project({}))).toEqual({ model: "", effort: "", github: "push" });
     expect(startChoice(project({ model: "opus", effort: "high" }))).toEqual({

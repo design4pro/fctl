@@ -3,6 +3,7 @@
 //! through the API; a review agent reads fctl's earlier findings and posts
 //! its review in its session's sandbox, through fctl-agent.
 
+use super::codex::{AgentArg, require_supported, subscription};
 use crate::config;
 use crate::style;
 use anyhow::{Context, Result, bail};
@@ -71,24 +72,25 @@ pub enum ReviewCmd {
     /// how they review (the project's owners; the person they run for may
     /// turn them off).
     #[command(
-        after_help = "Turning them on runs them on your Claude subscription; another owner takes them over with --mine, or by changing how they review. They review the repositories the project's agents may write to, those linked later too, but the ones --skip-repos names. With --drafts off, drafts wait until they're marked ready for review, which starts a review of their newest commit; fctl review start reviews one sooner. Where one of fctl's agents opened the pull request, its session gets the findings of --rounds reviews in a row while nobody messages its agent; then fctl holds them back until someone does, or passes them on (fctl review pass-on).\n\nExamples:\n  fctl review settings\n  fctl review settings --on --model opus --effort high\n  fctl review settings --instructions-file review.md\n  fctl review settings --bots dependabot,renovate\n  fctl review settings --skip-repos acme/shared-lib\n  fctl review settings --skip-repos none\n  fctl review settings --drafts off\n  fctl review settings --description-summary on\n  fctl review settings --rounds 3\n  fctl review settings --mine\n  fctl review settings --off"
+        after_help = "Turning them on runs them on your subscription; another owner takes them over with --mine, or by changing how they review. They review the repositories the project's agents may write to, those linked later too, but the ones --skip-repos names. With --drafts off, drafts wait until they're marked ready for review, which starts a review of their newest commit; fctl review start reviews one sooner. Where one of fctl's agents opened the pull request, its session gets the findings of --rounds reviews in a row while nobody messages its agent; then fctl holds them back until someone does, or passes them on (fctl review pass-on).\n\nExamples:\n  fctl review settings\n  fctl review settings --on --model opus --effort high\n  fctl review settings --instructions-file review.md\n  fctl review settings --bots dependabot,renovate\n  fctl review settings --skip-repos acme/shared-lib\n  fctl review settings --skip-repos none\n  fctl review settings --drafts off\n  fctl review settings --description-summary on\n  fctl review settings --rounds 3\n  fctl review settings --mine\n  fctl review settings --off"
     )]
     Settings {
-        /// Turn them on, on your Claude subscription.
+        /// Turn them on, on your subscription.
         #[arg(long, conflicts_with = "off")]
         on: bool,
         /// Turn them off. Reviews under way finish.
         #[arg(long)]
         off: bool,
-        /// Run them on your Claude subscription from now on.
+        /// Run them on your subscription from now on.
         #[arg(long)]
         mine: bool,
-        /// The model they review with (opus, sonnet, haiku, fable or a
-        /// model's ID); `default` for the project's.
+        /// Coding agent that reviews pull requests.
+        #[arg(long, value_enum)]
+        agent: Option<AgentArg>,
+        /// Model alias or ID; `default` for the project's.
         #[arg(long)]
         model: Option<String>,
-        /// Their effort level (low, medium, high, xhigh, max); `default` for
-        /// the project's.
+        /// Effort level; `default` for the project's.
         #[arg(long)]
         effort: Option<String>,
         /// What they're told besides fctl's own review instructions ("" for
@@ -189,7 +191,7 @@ pub async fn run(server: Option<&str>, args: ReviewArgs, json: bool) -> Result<(
             println!(
                 "  {}",
                 style::dim(&format!(
-                    "It runs on {}'s Claude subscription and posts what it finds on GitHub. Follow it: fctl attach {}",
+                    "It runs on {}'s subscription and posts what it finds on GitHub. Follow it: fctl attach {}",
                     review.operator.name, review.session_id
                 ))
             );
@@ -199,6 +201,7 @@ pub async fn run(server: Option<&str>, args: ReviewArgs, json: bool) -> Result<(
             on,
             off,
             mine,
+            agent,
             model,
             effort,
             instructions,
@@ -235,6 +238,7 @@ pub async fn run(server: Option<&str>, args: ReviewArgs, json: bool) -> Result<(
                 run_as_me: mine.then_some(true),
                 model: default(model),
                 effort: default(effort),
+                agent_kind: agent.map(Into::into),
                 instructions,
                 bots: bots.map(|b| b.0),
                 skipped_repos: skip_repos.map(|r| r.0),
@@ -243,6 +247,7 @@ pub async fn run(server: Option<&str>, args: ReviewArgs, json: bool) -> Result<(
                 rounds,
             };
             let changes = req != UpdateReviewAgentsRequest::default();
+            require_supported(&api, req.agent_kind).await?;
             let agents = if changes {
                 api.update_review_agents(&project, &req).await?
             } else {
@@ -641,7 +646,7 @@ fn agents_line(a: &ReviewAgents) -> String {
     }
     let mut parts = vec!["on".to_owned()];
     if let Some(op) = &a.operator {
-        parts.push(format!("on {}'s Claude subscription", op.name));
+        parts.push(format!("on {}'s {}", op.name, subscription(a.agent_kind)));
     }
     parts.push(
         a.model
@@ -677,11 +682,15 @@ fn print_settings(project: &str, a: &ReviewAgents) {
         row(
             "Runs on",
             format!(
-                "{}'s Claude subscription{}",
+                "{}'s {}{}",
                 op.name,
+                subscription(a.agent_kind),
                 if a.enabled { "" } else { " (when on)" }
             ),
         );
+    }
+    if let Some(agent) = a.agent_kind {
+        row("Agent", agent.as_str().into());
     }
     row(
         "Model",

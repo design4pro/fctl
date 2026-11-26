@@ -233,7 +233,8 @@ Each recipe says who does what: some steps take a person with a role in the proj
 ## Docs
 
 - [Overview](https://fctl.sh/docs/index.md): the three pieces (control plane, runners, clients), where to go next, and the words the docs use.
-- [Getting started](https://fctl.sh/docs/getting-started.md): signing in, installing the CLI, workspaces, connecting Claude, bringing a machine online, creating a project, starting, following and steering sessions, working together, roles.
+- [Getting started](https://fctl.sh/docs/getting-started.md): signing in, installing the CLI, workspaces, connecting subscriptions, bringing a machine online, creating a project, starting, following and steering sessions, working together, roles.
+- [Enable Codex](https://fctl.sh/docs/self-hosting.md#enable-codex): on your own instance, connect a ChatGPT plan with `fctl codex connect`, then choose Codex in the web app or with `fctl run --agent codex`.
 - [The CLI](https://fctl.sh/docs/cli.md): every command: sign-in and access tokens, sessions and sharing them, search, workspaces, projects with their secrets and members, repositories, ticket trackers, memory and retrospectives, review agents, schedules, notifications, Claude, hosts and `host.toml`, admin, your account, updating, exit codes.
 - [fctl for agents](https://fctl.sh/docs/agents.md): driving fctl from agents, scripts and other programs: tokens, what a personal agent asks its person before it signs in, waiting for sessions, reading transcripts, JSON and exit codes, pitfalls, recipes in full, and what agents do inside a session's sandbox.
 - [The HTTP API](https://fctl.sh/docs/api.md): authentication, errors, paging, and the endpoints for sessions, messages, events, schedules, projects, memory, retrospectives and reviews, with examples.

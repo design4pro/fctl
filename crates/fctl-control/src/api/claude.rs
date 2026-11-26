@@ -375,11 +375,11 @@ pub async fn remove_credential(ctx: &Ctx, user_id: &str, id: &str) -> AppResult<
     Ok(())
 }
 
-/// Stops sessions (`id`, `runner_id`) whose Claude connection was removed,
+/// Stops sessions (`id`, `runner_id`) whose connection was removed,
 /// and closes their runners' uplinks, as FleetDO does for those whose
 /// person may no longer run them. A session that doesn't stop is left to
 /// its runner, which gets nothing more for it.
-async fn stop_running(ctx: &Ctx, running: &[(&str, Option<&str>)]) {
+pub(crate) async fn stop_running(ctx: &Ctx, running: &[(&str, Option<&str>)]) {
     let Ok(fleet) = internal::fleet_stub(&ctx.env) else {
         return;
     };
@@ -396,7 +396,7 @@ async fn stop_running(ctx: &Ctx, running: &[(&str, Option<&str>)]) {
         .await;
         if let Err(e) = stopped {
             worker::console_error!(
-                "stopping {session_id}, whose Claude connection went: {}",
+                "stopping {session_id} after disconnecting its subscription: {}",
                 e.0.message
             );
         }

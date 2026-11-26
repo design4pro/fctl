@@ -597,6 +597,7 @@ dependencies = [
  "toml",
  "tracing",
  "tracing-subscriber",
+ "url",
 ]
 
 [[package]]
@@ -605,11 +606,17 @@ version = "0.38.1"
 dependencies = [
  "anyhow",
  "base64",
+ "bytes",
  "clap",
  "fctl-domain",
  "fctl-proto",
  "flate2",
  "hex",
+ "http",
+ "http-body-util",
+ "hyper",
+ "hyper-rustls",
+ "hyper-util",
  "libc",
  "nix",
  "serde",

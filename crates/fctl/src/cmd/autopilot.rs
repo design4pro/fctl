@@ -8,6 +8,7 @@
 //! and says when to wake: its `fctl` reaches the API through fctl-agent
 //! (`config::api`), with `FCTL_AUTOPILOT` naming its project.
 
+use super::codex::{AgentArg, require_supported, subscription};
 use crate::config;
 use crate::style;
 use anyhow::{Context, Result, bail};
@@ -51,8 +52,10 @@ pub struct Settings {
     /// all (every power its scope has) or none.
     #[arg(long, value_name = "POWERS")]
     pub powers: Option<String>,
-    /// The model of its own sessions (opus, sonnet…); `default` for the
-    /// project's.
+    /// Coding agent for the autopilot's own sessions.
+    #[arg(long, value_enum)]
+    pub agent: Option<AgentArg>,
+    /// Model alias or ID; `default` for the project's.
     #[arg(long)]
     pub model: Option<String>,
     /// Their effort level; `default` for the project's.
@@ -78,7 +81,7 @@ pub enum AutopilotCmd {
     /// Where it stands: its state, what it asks, its notes, sessions and
     /// plan (the default).
     Status,
-    /// Put the project on autopilot, on your Claude subscription: its
+    /// Put the project on autopilot, on your subscription: its
     /// workspace's admins let projects have one first.
     #[command(after_help = "Examples:
   fctl autopilot on -p crm --direction \"Build a CRM for small agencies: contacts, deals and a pipeline board. Ship it to crm.example.com.\"
@@ -104,7 +107,7 @@ pub enum AutopilotCmd {
     Set {
         #[command(flatten)]
         settings: Settings,
-        /// Run it on your Claude subscription from now on.
+        /// Run it on your subscription from now on.
         #[arg(long)]
         mine: bool,
     },
@@ -381,6 +384,7 @@ pub async fn run(server: Option<&str>, args: AutopilotArgs, json: bool) -> Resul
                 scope_for_all(&api, p, &settings).await
             };
             let mut req = settings.request(scope)?;
+            require_supported(&api, req.agent_kind).await?;
             if workspace {
                 req.scope = Some(AutopilotScope::Workspace);
             }
@@ -391,14 +395,16 @@ pub async fn run(server: Option<&str>, args: AutopilotArgs, json: bool) -> Resul
                 return style::print_json(&a);
             }
             println!(
-                "{} {} is on autopilot: it wakes now, on your Claude subscription. Follow it with fctl autopilot -p {p}.",
+                "{} {} is on autopilot: it wakes now, on your {}. Follow it with fctl autopilot -p {p}.",
                 style::accent("✓"),
                 style::bold(&a.project_slug),
+                subscription(a.agent_kind),
             );
         }
         AutopilotCmd::Set { settings, mine } => {
             let scope = scope_for_all(&api, p, &settings).await;
             let mut req = settings.request(scope)?;
+            require_supported(&api, req.agent_kind).await?;
             req.take_over = mine;
             let a = api.put_autopilot(p, &req).await?;
             if json {
@@ -1082,6 +1088,7 @@ impl Settings {
             crew_max: self.sessions,
             model: self.model,
             effort: self.effort,
+            agent_kind: self.agent.map(Into::into),
             handoff_at: self.handoff_at,
             take_over: false,
             keep_owner: self.keep_owner,
@@ -1242,7 +1249,8 @@ fn print_rules(a: &Autopilot) {
     println!(
         "  {}",
         style::dim(&format!(
-            "On {whose}'s Claude subscription{} · up to {} at once · checks in every {}",
+            "On {whose}'s {}{} · up to {} at once · checks in every {}",
+            subscription(a.agent_kind),
             if a.keep_owner {
                 ", even when others change it"
             } else {

@@ -11,6 +11,7 @@
 //! - `claude/projects/<dir>/<session>.jsonl` and `claude/projects/<dir>/<session>/…`:
 //!   Claude Code's conversation and what it keeps beside it (subagents'
 //!   conversations, long tool results), and `claude/todos/<session>…`;
+//! - `codex/thread.jsonl`: the Codex thread history;
 //! - `repos/<n>.bundle`: each repository's work that isn't on GitHub, as a
 //!   git bundle of a commit of its working tree (`refs/fctl/snapshot/<session>`)
 //!   on top of its commits not pushed. Git keeps what a tarball wouldn't:
@@ -24,14 +25,15 @@
 //! saved after that carry it on, as their work commit's second parent,
 //! until the branch has what it changed, or Claude deletes the ref.
 
-use crate::workspace::Paths;
+use crate::{codex, workspace::Paths};
 use anyhow::{Context, Result, anyhow, bail};
 use fctl_domain::snapshots::{self as snap, HEADER, Opener, SEGMENT, Sealer, TAG};
 use fctl_proto::agent::SnapshotSaved;
-use fctl_proto::runner::SessionSpec;
+use fctl_proto::{runner::SessionSpec, session::AgentKind};
 use serde::{Deserialize, Serialize};
+use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
-use std::io::{Read, Write};
+use std::io::{BufRead, Read, Write};
 use std::path::{Path, PathBuf};
 
 /// What `meta.json` says.
@@ -43,12 +45,38 @@ pub struct Meta {
     /// Where the conversation was: Claude Code's directory for the working
     /// directory, under `~/.claude/projects`.
     pub conversation_dir: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    codex_thread: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    codex_rollout: Option<String>,
     pub workdir: String,
     pub repos: Vec<RepoMeta>,
     /// Images it left out of the conversation, to stay within the limit.
     #[serde(default)]
     pub images_left_out: usize,
 }
+
+impl Meta {
+    fn has_conversation(&self) -> bool {
+        self.conversation_dir.is_some() || self.codex_rollout.is_some()
+    }
+}
+
+pub enum History<'a> {
+    Claude(Option<&'a str>),
+    Codex(&'a str),
+}
+
+impl History<'_> {
+    fn claude_version(&self) -> Option<&str> {
+        match self {
+            Self::Claude(version) => *version,
+            Self::Codex(_) => None,
+        }
+    }
+}
+
+const CODEX_ARCHIVE_PATH: &str = "codex/thread.jsonl";
 
 /// A repository's work in a snapshot.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -360,36 +388,54 @@ struct Parts {
 }
 
 /// Collects what a snapshot of the session holds.
-async fn collect(paths: &Paths, spec: &SessionSpec, claude_version: Option<&str>) -> Result<Parts> {
+async fn collect(paths: &Paths, spec: &SessionSpec, history: &History<'_>) -> Result<Parts> {
     let id = &spec.claude_session_id;
     let mut meta = Meta {
         version: 1,
         claude_session_id: id.clone(),
-        claude_version: claude_version.map(str::to_owned),
+        claude_version: history.claude_version().map(str::to_owned),
         workdir: paths.workdir.display().to_string(),
         ..Meta::default()
     };
     let mut files = Vec::new();
-    if let Some(dir) = find_conversation(&paths.home, id) {
-        let base = paths.home.join(".claude/projects").join(&dir);
-        files.push((
-            format!("claude/projects/{dir}/{id}.jsonl"),
-            std::fs::read(base.join(format!("{id}.jsonl")))?,
-        ));
-        // What Claude Code keeps beside it: subagents, long tool results.
-        let side = base.join(id);
-        if side.is_dir() {
-            for (rel, bytes) in read_tree(&side)? {
-                files.push((format!("claude/projects/{dir}/{id}/{rel}"), bytes));
+    match history {
+        History::Claude(_) => {
+            if let Some(dir) = find_conversation(&paths.home, id) {
+                let base = paths.home.join(".claude/projects").join(&dir);
+                files.push((
+                    format!("claude/projects/{dir}/{id}.jsonl"),
+                    std::fs::read(base.join(format!("{id}.jsonl")))?,
+                ));
+                // What Claude Code keeps beside it: subagents, long tool results.
+                let side = base.join(id);
+                if side.is_dir() {
+                    for (rel, bytes) in read_tree(&side)? {
+                        files.push((format!("claude/projects/{dir}/{id}/{rel}"), bytes));
+                    }
+                }
+                meta.conversation_dir = Some(dir);
+            }
+            if let Ok(todos) = std::fs::read_dir(paths.home.join(".claude/todos")) {
+                for t in todos.flatten() {
+                    let name = t.file_name().to_string_lossy().into_owned();
+                    if name.starts_with(id.as_str()) && t.path().is_file() {
+                        files.push((format!("claude/todos/{name}"), std::fs::read(t.path())?));
+                    }
+                }
             }
         }
-        meta.conversation_dir = Some(dir);
-    }
-    if let Ok(todos) = std::fs::read_dir(paths.home.join(".claude/todos")) {
-        for t in todos.flatten() {
-            let name = t.file_name().to_string_lossy().into_owned();
-            if name.starts_with(id.as_str()) && t.path().is_file() {
-                files.push((format!("claude/todos/{name}"), std::fs::read(t.path())?));
+        History::Codex(thread) => {
+            let home = codex::history_home(&paths.home, spec.session_id.as_str());
+            meta.codex_thread = Some((*thread).to_owned());
+            if let Some(path) = codex::rollout(&home, thread) {
+                let relative = path.strip_prefix(&home)?.to_string_lossy();
+                if codex_rollout_path(&relative, thread).is_some() {
+                    let bytes = codex_history(&path)?;
+                    if !bytes.is_empty() {
+                        files.push((CODEX_ARCHIVE_PATH.to_owned(), bytes));
+                        meta.codex_rollout = Some(relative.into_owned());
+                    }
+                }
             }
         }
     }
@@ -416,6 +462,93 @@ async fn collect(paths: &Paths, spec: &SessionSpec, claude_version: Option<&str>
         bundles,
         failed,
     })
+}
+
+fn codex_rollout_path<'a>(path: &'a str, thread: &str) -> Option<&'a Path> {
+    let parts: Vec<_> = path.split('/').collect();
+    let ["sessions", year, month, day, file] = parts.as_slice() else {
+        return None;
+    };
+    let date = [(*year, 4), (*month, 2), (*day, 2)];
+    (codex::valid_id(thread)
+        && date
+            .into_iter()
+            .all(|(part, n)| part.len() == n && part.bytes().all(|b| b.is_ascii_digit()))
+        && file.starts_with("rollout-")
+        && file.ends_with(&format!("-{thread}.jsonl"))
+        && file
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b"-_.".contains(&b)))
+    .then(|| Path::new(path))
+}
+
+/// A rollout has conversation records alongside App Server state. Only
+/// the records needed to reconstruct the thread go to the snapshot.
+fn codex_history(path: &Path) -> Result<Vec<u8>> {
+    let file = std::fs::File::open(path)?;
+    let mut out = Vec::new();
+    for line in std::io::BufReader::new(file).lines() {
+        let line = line?;
+        if serde_json::from_str::<Value>(&line).ok().is_some_and(|v| {
+            matches!(
+                v.get("type").and_then(Value::as_str),
+                Some("session_meta" | "response_item" | "compacted" | "turn_context" | "event_msg")
+            )
+        }) {
+            out.extend_from_slice(line.as_bytes());
+            out.push(b'\n');
+        }
+    }
+    Ok(out)
+}
+
+fn codex_without_images(jsonl: &str) -> (String, usize) {
+    fn strip(value: &mut Value) -> usize {
+        match value {
+            Value::Array(items) => items.iter_mut().map(strip).sum(),
+            Value::Object(fields) => match fields.get("type").and_then(Value::as_str) {
+                Some("input_image")
+                    if fields
+                        .get("image_url")
+                        .and_then(Value::as_str)
+                        .is_some_and(|s| s.starts_with("data:")) =>
+                {
+                    *value = json!({"type": "input_text", "text": snap::IMAGE_LEFT_OUT});
+                    1
+                }
+                Some("image")
+                    if fields
+                        .get("image_url")
+                        .or_else(|| fields.get("url"))
+                        .and_then(Value::as_str)
+                        .is_some_and(|s| s.starts_with("data:")) =>
+                {
+                    *value =
+                        json!({"type": "text", "text": snap::IMAGE_LEFT_OUT, "text_elements": []});
+                    1
+                }
+                _ => fields.values_mut().map(strip).sum(),
+            },
+            _ => 0,
+        }
+    }
+    let mut out = String::new();
+    let mut left = 0;
+    for line in jsonl.lines() {
+        if let Ok(mut record) = serde_json::from_str::<Value>(line) {
+            let n = strip(&mut record);
+            if n > 0 {
+                left += n;
+                out.push_str(&record.to_string());
+            } else {
+                out.push_str(line);
+            }
+        } else {
+            out.push_str(line);
+        }
+        out.push('\n');
+    }
+    (out, left)
 }
 
 /// Every file under `dir`, by its path from there.
@@ -526,12 +659,12 @@ pub async fn save(
     spec: &SessionSpec,
     key: &[u8],
     max_bytes: u64,
-    claude_version: Option<&str>,
+    history: History<'_>,
     agent_seq: u64,
     dir: &Path,
 ) -> Result<Option<Saved>> {
-    let mut parts = collect(paths, spec, claude_version).await?;
-    if parts.meta.conversation_dir.is_none() && parts.bundles.is_empty() {
+    let mut parts = collect(paths, spec, &history).await?;
+    if !parts.meta.has_conversation() && parts.bundles.is_empty() {
         if let Some((name, why)) = parts.failed.first() {
             bail!("saving the work in {name} failed: {why}");
         }
@@ -542,13 +675,17 @@ pub async fn save(
     let sealed = dir.join("snapshot.sealed");
     let mut left_out = Vec::new();
     let mut size = sealed_size(pack(&parts, &packed)?);
-    if size > max_bytes && parts.meta.conversation_dir.is_some() {
+    if size > max_bytes && parts.meta.has_conversation() {
         let mut images = 0;
         for (name, bytes) in parts.files.iter_mut() {
             if name.ends_with(".jsonl")
                 && let Ok(text) = std::str::from_utf8(bytes)
             {
-                let (stripped, n) = snap::without_images(text);
+                let (stripped, n) = if name == CODEX_ARCHIVE_PATH {
+                    codex_without_images(text)
+                } else {
+                    snap::without_images(text)
+                };
                 if n > 0 {
                     images += n;
                     *bytes = stripped.into_bytes();
@@ -561,7 +698,7 @@ pub async fn save(
             size = sealed_size(pack(&parts, &packed)?);
         }
     }
-    if size > max_bytes && !parts.bundles.is_empty() && parts.meta.conversation_dir.is_some() {
+    if size > max_bytes && !parts.bundles.is_empty() && parts.meta.has_conversation() {
         parts.bundles.clear();
         parts.meta.repos.clear();
         left_out.push("changes".to_owned());
@@ -581,9 +718,9 @@ pub async fn save(
         saved: SnapshotSaved {
             size: std::fs::metadata(&sealed)?.len(),
             sha256,
-            claude_version: claude_version.map(str::to_owned),
+            claude_version: history.claude_version().map(str::to_owned),
             agent_seq,
-            conversation: parts.meta.conversation_dir.is_some(),
+            conversation: parts.meta.has_conversation(),
             changes: !parts.meta.repos.is_empty(),
             left_out,
         },
@@ -671,6 +808,7 @@ pub fn sha256_of(path: &Path) -> Result<String> {
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Restored {
     pub conversation: bool,
+    pub codex_thread: Option<String>,
     /// The repositories whose work is back in their working tree.
     pub changes: Vec<String>,
     /// The repositories whose branch moved on since, whose work is at
@@ -760,7 +898,12 @@ pub async fn restore(
     if meta.claude_session_id != spec.claude_session_id {
         return Err("it is another conversation's".into());
     }
-    if let Some(why) = snap::unreadable_by(meta.claude_version.as_deref(), claude_version) {
+    let codex = spec.agent_kind == Some(AgentKind::Codex);
+    if codex != meta.codex_thread.is_some() {
+        return Err("it belongs to a different agent kind".into());
+    }
+    if !codex && let Some(why) = snap::unreadable_by(meta.claude_version.as_deref(), claude_version)
+    {
         return Err(why);
     }
     let mut restored = Restored {
@@ -768,7 +911,7 @@ pub async fn restore(
         ..Restored::default()
     };
     let id = &meta.claude_session_id;
-    if let Some(saved_dir) = &meta.conversation_dir {
+    if !codex && let Some(saved_dir) = &meta.conversation_dir {
         let here = conversation_dir(&paths.workdir);
         let projects = paths.home.join(".claude/projects");
         let from = into.join("claude/projects").join(saved_dir);
@@ -780,6 +923,19 @@ pub async fn restore(
         if todos.is_dir() {
             let _ = copy_into(&todos, &paths.home.join(".claude/todos"));
         }
+    }
+    if let (Some(thread), Some(relative)) = (meta.codex_thread, meta.codex_rollout) {
+        let path = codex_rollout_path(&relative, &thread)
+            .ok_or_else(|| "it has an invalid Codex thread path".to_owned())?;
+        let home = codex::history_home(&paths.home, spec.session_id.as_str());
+        let from = into.join(CODEX_ARCHIVE_PATH);
+        if !std::fs::symlink_metadata(&from).is_ok_and(|m| m.is_file()) {
+            return Err("its Codex thread history is missing".into());
+        }
+        copy_into(&from, &home.join(path))
+            .map_err(|e| format!("putting the Codex thread back failed: {e:#}"))?;
+        restored.conversation = true;
+        restored.codex_thread = Some(thread);
     }
     let session = spec.session_id.as_str();
     for repo in &meta.repos {
@@ -970,6 +1126,75 @@ mod tests {
         Ok(Paths::new(&home.join("workspace"), &home, &state))
     }
 
+    #[tokio::test]
+    async fn a_codex_snapshot_restores_only_the_assigned_thread_history() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let a = root.path().join("a");
+        let b = root.path().join("b");
+        for home in [&a, &b] {
+            std::fs::create_dir_all(home.join("workspace"))?;
+            sh(&home.join("workspace"), "git init -q").await?;
+        }
+        let a = Paths::new(&a.join("workspace"), &a, &a.join("state"));
+        let b = Paths::new(&b.join("workspace"), &b, &b.join("state"));
+        let thread = "0193fe6b-0000-7000-8000-000000000001";
+        let other = "0193fe6b-0000-7000-8000-000000000002";
+        let mut spec = spec(thread)?;
+        spec.agent_kind = Some(AgentKind::Codex);
+        let history = codex::history_home(&a.home, spec.session_id.as_str());
+        let dir = history.join("sessions/2026/11/26");
+        std::fs::create_dir_all(&dir)?;
+        std::fs::write(history.join("auth.json"), "{}")?;
+        let content =
+            format!("{{\"type\":\"session_meta\",\"payload\":{{\"id\":\"{thread}\"}}}}\n");
+        std::fs::write(
+            dir.join(format!("rollout-when-{thread}.jsonl")),
+            format!("{content}{{\"type\":\"world_state\",\"payload\":{{}}}}\n"),
+        )?;
+        std::fs::write(dir.join(format!("rollout-when-{other}.jsonl")), &content)?;
+
+        let key = [9; 32];
+        let saved = save(
+            &a,
+            &spec,
+            &key,
+            500_000,
+            History::Codex(thread),
+            1,
+            &root.path().join("archive"),
+        )
+        .await?
+        .context("Codex snapshot")?;
+        assert!(saved.saved.conversation);
+        assert!(saved.saved.claude_version.is_none());
+        let unpacked = root.path().join("unpacked");
+        let meta = unpack(&saved.file, &key, &unpacked)?;
+        assert_eq!(meta.codex_thread.as_deref(), Some(thread));
+        assert_eq!(
+            std::fs::read_to_string(unpacked.join(CODEX_ARCHIVE_PATH))?,
+            content
+        );
+        assert_eq!(std::fs::read_dir(unpacked.join("codex"))?.count(), 1);
+        let restored = restore(
+            &b,
+            &spec,
+            &saved.file,
+            &key,
+            &saved.saved.sha256,
+            None,
+            &root.path().join("scratch"),
+        )
+        .await
+        .map_err(|error| anyhow!(error))?;
+        assert_eq!(restored.codex_thread.as_deref(), Some(thread));
+        let home = codex::history_home(&b.home, spec.session_id.as_str());
+        let rollout = codex::rollout(&home, thread).context("restored rollout")?;
+        assert_eq!(std::fs::read_to_string(rollout)?, content);
+        assert!(codex::rollout(&home, other).is_none());
+        assert!(!home.join("auth.json").exists());
+        Ok(())
+    }
+
     /// A session saved in one sandbox resumes in a fresh clone with its
     /// conversation, its commits not pushed and its uncommitted work, as
     /// uncommitted work: changed, new and deleted files.
@@ -1014,7 +1239,7 @@ mod tests {
             &s,
             &key,
             10_000_000,
-            Some("2.1.140"),
+            History::Claude(Some("2.1.140")),
             42,
             &root.path().join("out"),
         )
@@ -1127,7 +1352,7 @@ mod tests {
                 &s,
                 &key,
                 10_000_000,
-                None,
+                History::Claude(None),
                 1,
                 &root.path().join(format!("out{n}")),
             )
@@ -1210,9 +1435,17 @@ mod tests {
         let a = sandbox(root.path(), "a", &origin).await?;
         sh(&a.workdir, "echo mine > a.txt").await?;
         let key = [3u8; 32];
-        let saved = save(&a, &s, &key, 10_000_000, None, 1, &root.path().join("out"))
-            .await?
-            .ok_or_else(|| anyhow!("nothing saved"))?;
+        let saved = save(
+            &a,
+            &s,
+            &key,
+            10_000_000,
+            History::Claude(None),
+            1,
+            &root.path().join("out"),
+        )
+        .await?
+        .ok_or_else(|| anyhow!("nothing saved"))?;
         // Someone pushes to the branch meanwhile.
         sh(
             &seed,
@@ -1246,9 +1479,17 @@ mod tests {
         // next snapshot carries the waiting work on, and a restore where
         // the branch is as it was saved puts the tree back and keeps the
         // work waiting.
-        let again = save(&b, &s, &key, 10_000_000, None, 2, &root.path().join("out4"))
-            .await?
-            .ok_or_else(|| anyhow!("the waiting work wasn't carried on"))?;
+        let again = save(
+            &b,
+            &s,
+            &key,
+            10_000_000,
+            History::Claude(None),
+            2,
+            &root.path().join("out4"),
+        )
+        .await?
+        .ok_or_else(|| anyhow!("the waiting work wasn't carried on"))?;
         assert!(again.saved.changes && again.failed.is_empty());
         assert_eq!(
             sh(
@@ -1295,9 +1536,17 @@ mod tests {
         .await?;
         sh(&d.workdir, "git fetch -q origin").await?;
         assert!(
-            save(&d, &s, &key, 10_000_000, None, 3, &root.path().join("out5"))
-                .await?
-                .is_none()
+            save(
+                &d,
+                &s,
+                &key,
+                10_000_000,
+                History::Claude(None),
+                3,
+                &root.path().join("out5")
+            )
+            .await?
+            .is_none()
         );
         assert_eq!(
             sh(
@@ -1339,9 +1588,17 @@ mod tests {
         )
         .await?;
         let local = sh(&g.workdir, "git rev-parse HEAD").await?;
-        let again3 = save(&g, &s, &key, 10_000_000, None, 5, &root.path().join("out8"))
-            .await?
-            .ok_or_else(|| anyhow!("nothing saved"))?;
+        let again3 = save(
+            &g,
+            &s,
+            &key,
+            10_000_000,
+            History::Claude(None),
+            5,
+            &root.path().join("out8"),
+        )
+        .await?
+        .ok_or_else(|| anyhow!("nothing saved"))?;
         sh(
             &d.workdir,
             "git pull -q origin main && echo more > m.txt && git add m.txt && git commit -qm more && git push -q origin HEAD:main",
@@ -1373,9 +1630,17 @@ mod tests {
         // work can't be put back, and the restore says so.
         let e = sandbox(root.path(), "e", &origin).await?;
         sh(&e.workdir, "echo late > c.txt && git add c.txt && git commit -qm late && git push -q origin HEAD:main && echo draft > d.txt").await?;
-        let late = save(&e, &s, &key, 10_000_000, None, 4, &root.path().join("out6"))
-            .await?
-            .ok_or_else(|| anyhow!("nothing saved"))?;
+        let late = save(
+            &e,
+            &s,
+            &key,
+            10_000_000,
+            History::Claude(None),
+            4,
+            &root.path().join("out6"),
+        )
+        .await?
+        .ok_or_else(|| anyhow!("nothing saved"))?;
         sh(
             &seed,
             &format!(
@@ -1413,12 +1678,29 @@ mod tests {
         // Nothing to save: no conversation, nothing changed.
         let c = sandbox(root.path(), "c", &origin).await?;
         assert!(
-            save(&c, &s, &key, 10_000_000, None, 1, &root.path().join("out3"))
-                .await?
-                .is_none()
+            save(
+                &c,
+                &s,
+                &key,
+                10_000_000,
+                History::Claude(None),
+                1,
+                &root.path().join("out3")
+            )
+            .await?
+            .is_none()
         );
         // Over the limit with work alone: nothing fits.
-        let big = save(&a, &s, &key, 10, None, 1, &root.path().join("out2")).await;
+        let big = save(
+            &a,
+            &s,
+            &key,
+            10,
+            History::Claude(None),
+            1,
+            &root.path().join("out2"),
+        )
+        .await;
         assert!(big.is_err());
         Ok(())
     }

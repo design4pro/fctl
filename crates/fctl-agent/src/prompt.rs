@@ -1,5 +1,4 @@
-//! The text fctl gives Claude: what it appends to the system prompt, and the
-//! AGENTS.md at the root of the sandbox's home, beside the checkout.
+//! The system prompt and instructions fctl gives its agents.
 
 use crate::caches::Ready;
 use crate::claude::Exit;
@@ -9,7 +8,7 @@ use crate::workspace::Paths;
 use fctl_domain::{files, memory, size};
 use fctl_proto::event::Attachment;
 use fctl_proto::runner::{MemorySpec, ReviewSpec, SandboxSize, SessionRepo, SessionSpec};
-use fctl_proto::session::{GithubAccess, RepoAccess, UserRef, Verbosity};
+use fctl_proto::session::{AgentKind, GithubAccess, RepoAccess, UserRef, Verbosity};
 use fctl_proto::tickets::TicketsVia;
 use std::path::PathBuf;
 
@@ -244,8 +243,8 @@ const MEMORY_MD: &str = r#"
   added since this one started, and `fctl memory --stale` the stale ones
   too.
 - The project's people see every note, with the session that wrote it, and
-  delete the ones they don't want. Claude Code's own memory is off here: it
-  would last only as long as this sandbox.
+  delete the ones they don't want. Use the project's memory for what should
+  survive this sandbox.
 - If `fctl memory` fails, carry on with the task.
 "#;
 
@@ -483,6 +482,8 @@ pub fn system_prompt(
     asks_cli: bool,
     autopilot_cli: bool,
 ) -> String {
+    let codex = spec.agent_kind == Some(AgentKind::Codex);
+    let runtime = if codex { "Codex" } else { "Claude Code" };
     let mut s = String::new();
     s.push_str("You are running as an autonomous agent in fctl, a software factory. ");
     s.push_str("Your work happens in a sandbox; people follow along live and may message you.\n\n");
@@ -550,7 +551,7 @@ pub fn system_prompt(
         // the sandbox to its size, and Apple's container gives each VM a CPU
         // more than its sandbox, so build tools would start too many jobs.
         s.push_str(&format!(
-            "- This sandbox has {} and {} of memory ($FCTL_SANDBOX_CPUS, $FCTL_SANDBOX_MEMORY_MB), even where `nproc` and `free` show more. Size parallel builds and test runs to these limits (for example `make -j{}`): when the sandbox runs out of memory, the kernel kills a process, which then exits with code 137, and that may be Claude Code itself, which cuts your turn off: run one heavy job at a time, such as a browser with its dev server, or a large build. fctl-agent tells you at your next step when the sandbox's memory is nearly out, and when the kernel killed a process for want of it.\n",
+            "- This sandbox has {} and {} of memory ($FCTL_SANDBOX_CPUS, $FCTL_SANDBOX_MEMORY_MB), even where `nproc` and `free` show more. Size parallel builds and test runs to these limits (for example `make -j{}`): when the sandbox runs out of memory, the kernel kills a process, which then exits with code 137, and that may be {runtime} itself, which cuts your turn off: run one heavy job at a time, such as a browser with its dev server, or a large build. fctl-agent tells you at your next step when the sandbox's memory is nearly out, and when the kernel killed a process for want of it.\n",
             size::cpus(size.cpus),
             size::memory(size.memory_mb.into()),
             size.cpus
@@ -629,11 +630,18 @@ pub fn system_prompt(
         s.push_str("- If you are blocked on a decision only a person can make, say so plainly and stop; someone will answer.\n");
     }
     let idle = tasks::idle_timeout(spec);
-    s.push_str(&format!(
-        "- When your turn ends, the session waits for a message, and after {} without one it stops, along with everything still running in the sandbox. Background work you start (a shell command with `run_in_background`, a subagent, a Monitor) keeps the session up while it runs, for up to {} after your turn ends: you can end your turn to wait for it, and you get its result in a new turn. Stop background processes you no longer need, like a dev server, so that the session can stop: by their PIDs, or start one with `setsid` and stop its process group with `kill -- -<pid>`. Don't use `pkill -f`: its pattern matches the shell that runs it too, whose command line holds the pattern, and may match Claude Code.\n",
-        tasks::duration(idle),
-        tasks::duration(tasks::limit(idle))
-    ));
+    if codex {
+        s.push_str(&format!(
+            "- When your turn ends, the session waits for a message. After {} without one it stops, along with everything still running in the sandbox. Gather the results of work you started before ending the turn. Stop background processes you no longer need by their PIDs.\n",
+            tasks::duration(idle),
+        ));
+    } else {
+        s.push_str(&format!(
+            "- When your turn ends, the session waits for a message, and after {} without one it stops, along with everything still running in the sandbox. Background work you start (a shell command with `run_in_background`, a subagent, a Monitor) keeps the session up while it runs, for up to {} after your turn ends: you can end your turn to wait for it, and you get its result in a new turn. Stop background processes you no longer need, like a dev server, so that the session can stop: by their PIDs, or start one with `setsid` and stop its process group with `kill -- -<pid>`. Don't use `pkill -f`: its pattern matches the shell that runs it too, whose command line holds the pattern, and may match Claude Code.\n",
+            tasks::duration(idle),
+            tasks::duration(tasks::limit(idle))
+        ));
+    }
     if opens_pull_requests {
         s.push_str(&pull_request_descriptions(
             spec.project.settings.pull_request_descriptions,
@@ -1239,6 +1247,7 @@ mod tests {
 
     fn spec() -> SessionSpec {
         SessionSpec {
+            agent_kind: None,
             session_id: SessionId("ses_1".into()),
             number: 1,
             title: "Build it".into(),
@@ -1268,7 +1277,7 @@ mod tests {
             effort: None,
             secrets: Default::default(),
             credentials: SessionCredentials {
-                claude: ClaudeCredential {
+                claude: Some(ClaudeCredential {
                     id: CredentialId("crd_1".into()),
                     kind: ClaudeCredentialKind::SetupToken,
                     access_token: "token".into(),
@@ -1278,7 +1287,8 @@ mod tests {
                     account: None,
                     on_runners: false,
                     stand_in: false,
-                },
+                }),
+                codex: None,
                 github: None,
                 github_read: None,
             },

@@ -118,7 +118,9 @@ pub fn dev(root: &Path, opts: DevOpts) -> Result<()> {
     let mut children = Children(Vec::new());
     if local {
         linear::start(root, &state.join("linear"), &mut children)?;
-        wrangler_dev(root, &mut children, None, &linear::vars())?;
+        let mut vars = linear::vars();
+        vars.push(("FCTL_CODEX_ENABLED", "1".into()));
+        wrangler_dev(root, &mut children, None, &vars)?;
     }
     wait_for(
         &format!("{}/api/v1/health", api()),
@@ -129,6 +131,9 @@ pub fn dev(root: &Path, opts: DevOpts) -> Result<()> {
     let token = bootstrap(&state)?;
     if local {
         linear::connect(root, &token)?;
+        let auth = Auth::Bearer(token.clone());
+        let response = call("POST", "/dev/codex", Some(&auth), None)?;
+        ok("connecting the fake ChatGPT plan", &response)?;
     }
     if !no_vite {
         // Vite itself, not `npm run dev`: npm doesn't pass SIGINT on, and
@@ -339,9 +344,90 @@ fn smoke(root: &Path, token: &str, local: bool, children: &mut Children) -> Resu
     if local {
         passed.push_str("; ");
         passed.push_str(&linear::smoke(root, token, children)?);
+        codex_smoke(token, children)?;
+        passed.push_str("; fake Codex ran and resumed");
     }
     eprintln!("\n\x1b[1msmoke test passed\x1b[0m: {passed}\n");
     Ok(())
+}
+
+fn codex_smoke(token: &str, children: &mut Children) -> Result<()> {
+    let auth = Auth::Bearer(token.to_owned());
+    let response = call(
+        "POST",
+        "/projects/playground/sessions",
+        Some(&auth),
+        Some(json!({"prompt":"First Codex turn", "agent_kind":"codex"})),
+    )?;
+    ok("starting a Codex session", &response)?;
+    let session: Session = serde_json::from_value(response.1)?;
+    let id = session.id.as_str();
+    wait_for_codex(id, &auth, children, "First Codex turn", 16)?;
+
+    let stopped = call("POST", &format!("/sessions/{id}/stop"), Some(&auth), None)?;
+    ok("stopping the Codex session", &stopped)?;
+    let start = Instant::now();
+    loop {
+        children.check()?;
+        let response = call("GET", &format!("/sessions/{id}"), Some(&auth), None)?;
+        ok("reading the stopped Codex session", &response)?;
+        if response.1["status"] == "stopped" {
+            break;
+        }
+        if start.elapsed() > Duration::from_secs(30) {
+            bail!("the Codex session did not stop");
+        }
+        std::thread::sleep(Duration::from_millis(150));
+    }
+
+    let response = call(
+        "POST",
+        &format!("/sessions/{id}/resume"),
+        Some(&auth),
+        Some(json!({"prompt":"Resumed Codex turn"})),
+    )?;
+    ok("resuming the Codex session", &response)?;
+    wait_for_codex(id, &auth, children, "Resumed Codex turn", 32)
+}
+
+fn wait_for_codex(
+    id: &str,
+    auth: &Auth,
+    children: &mut Children,
+    task: &str,
+    input_tokens: u64,
+) -> Result<()> {
+    let start = Instant::now();
+    while start.elapsed() < Duration::from_secs(60) {
+        children.check()?;
+        let response = call("GET", &format!("/sessions/{id}"), Some(auth), None)?;
+        ok("reading the Codex session", &response)?;
+        if response.1["status"] == "failed" {
+            bail!("the Codex session failed: {}", response.1["status_reason"]);
+        }
+        if response.1["status"] == "idle"
+            && response.1["stats"]["input_tokens"]
+                .as_u64()
+                .is_some_and(|tokens| tokens >= input_tokens)
+        {
+            let events = call(
+                "GET",
+                &format!("/sessions/{id}/events?limit=200"),
+                Some(auth),
+                None,
+            )?;
+            ok("reading the Codex transcript", &events)?;
+            if events
+                .1
+                .to_string()
+                .contains(&format!("Fake Codex finished: {task}"))
+            {
+                return Ok(());
+            }
+        }
+        std::thread::sleep(Duration::from_millis(150));
+    }
+    bail!("the Codex session did not show {task} and its token usage")
 }
 
 /// A machine enrolls with an enrollment token that asks for approval, as
@@ -1070,6 +1156,14 @@ fn host(root: &Path, state: &Path, token: &str) -> Result<Child> {
         write_private(&token_file, rt)?;
     }
     let bin = util::target_dir(root).join("debug");
+    let tools = state.join("bin");
+    std::fs::create_dir_all(&tools)?;
+    let codex = tools.join("codex");
+    if !codex.exists() {
+        std::os::unix::fs::symlink(bin.join("fake-claude"), codex)?;
+    }
+    let path = std::env::var_os("PATH").unwrap_or_default();
+    let path = std::env::join_paths(std::iter::once(tools).chain(std::env::split_paths(&path)))?;
     let toml = format!(
         "# Written by cargo xtask dev.\n\
          server = \"{api}\"\n\
@@ -1096,6 +1190,7 @@ fn host(root: &Path, state: &Path, token: &str) -> Result<Child> {
             .args(["host", "run"])
             .env("FCTL_CONFIG_DIR", &config)
             .env("FCTL_DATA_DIR", state.join("data"))
+            .env("PATH", path)
             .env(
                 "RUST_LOG",
                 std::env::var("RUST_LOG").unwrap_or_else(|_| "info".into()),

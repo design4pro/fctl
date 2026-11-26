@@ -773,6 +773,8 @@ pub struct SessionRow {
     pub creator_name: Option<String>,
     pub creator_avatar: Option<String>,
     pub credential_id: Option<String>,
+    #[serde(default)]
+    pub agent_kind: Option<fctl_proto::session::AgentKind>,
     /// The Claude connection it runs on, when it is the caller's.
     #[serde(default)]
     pub my_credential_id: Option<String>,
@@ -973,7 +975,11 @@ impl SessionRow {
         }
     }
 
-    /// Whose Claude subscription it runs on, while their connection exists.
+    pub fn agent(&self) -> fctl_proto::session::AgentKind {
+        self.agent_kind.unwrap_or_default()
+    }
+
+    /// Whose subscription it runs on, while their connection exists.
     pub fn claude_ref(&self) -> Option<UserRef> {
         Some(UserRef {
             id: UserId(self.claude_user_id.clone()?),
@@ -1028,7 +1034,11 @@ impl SessionRow {
                     _ => None,
                 },
                 model: self.model.clone(),
-                effort: self.claude_effort.clone(),
+                effort: if self.agent() == fctl_proto::session::AgentKind::Codex {
+                    self.effort.clone()
+                } else {
+                    self.claude_effort.clone()
+                },
                 github_access: Some(self.github_access()),
                 github_issues: self.github_issues.then_some(true),
                 remote_control: self
@@ -1048,8 +1058,16 @@ impl SessionRow {
                     serde_json::from_str::<fctl_proto::session::SessionQuestion>(j).ok()
                 }),
                 autopilot: self.autopilot(),
-                claude: self.claude_ref(),
-                claude_connection: self.my_credential_id.clone().map(fctl_proto::CredentialId),
+                agent_kind: self.agent_kind,
+                claude: (self.agent() == fctl_proto::session::AgentKind::Claude)
+                    .then(|| self.claude_ref())
+                    .flatten(),
+                codex: (self.agent() == fctl_proto::session::AgentKind::Codex)
+                    .then(|| self.claude_ref())
+                    .flatten(),
+                claude_connection: (self.agent() == fctl_proto::session::AgentKind::Claude)
+                    .then(|| self.my_credential_id.clone().map(fctl_proto::CredentialId))
+                    .flatten(),
                 service_account: self.service_account_id.as_ref().map(|id| {
                     fctl_proto::session::SessionServiceAccount {
                         id: fctl_proto::ServiceAccountId(id.clone()),
@@ -1070,7 +1088,7 @@ impl SessionRow {
 /// they were demoted) counts for nothing.
 pub const SESSION_SELECT: &str = "SELECT s.id, s.project_id, p.slug AS project_slug, s.number, s.title, s.description, s.prompt, s.prompt_attachments, \
     s.status, s.status_reason, s.resume_at, s.created_by, cu.name AS creator_name, cu.avatar_url AS creator_avatar, \
-    s.credential_id, CASE WHEN cc.user_id = ?1 THEN s.credential_id END AS my_credential_id, cc.user_id AS claude_user_id, ccu.name AS claude_user_name, ccu.avatar_url AS claude_user_avatar, \
+    s.agent_kind, s.credential_id, CASE WHEN cc.user_id = ?1 THEN s.credential_id END AS my_credential_id, cc.user_id AS claude_user_id, ccu.name AS claude_user_name, ccu.avatar_url AS claude_user_avatar, \
     s.runner_id, r.name AS runner_name, s.branch, s.base_branch, s.model, s.effort, \
     s.claude_effort, s.claude_session_id, s.pr_number, s.pr_url, s.pr_title, s.pr_state, s.pull_requests, s.remote_control, s.stats, s.archived, \
     s.github_access, json_extract(p.settings, '$.github_access') AS project_github_access, s.github_issues, \
@@ -1091,7 +1109,7 @@ pub const SESSION_SELECT: &str = "SELECT s.id, s.project_id, p.slug AS project_s
     LEFT JOIN workspaces w ON w.id = p.workspace_id \
     LEFT JOIN workspace_members wm ON wm.workspace_id = p.workspace_id AND wm.user_id = ?1 \
     LEFT JOIN users cu ON cu.id = s.created_by \
-    LEFT JOIN claude_credentials cc ON cc.id = s.credential_id \
+    LEFT JOIN session_credentials cc ON cc.id = s.credential_id AND cc.agent_kind = COALESCE(s.agent_kind, 'claude') \
     LEFT JOIN users ccu ON ccu.id = cc.user_id \
     LEFT JOIN runners r ON r.id = s.runner_id \
     LEFT JOIN project_members m ON m.project_id = s.project_id AND m.user_id = ?1 \

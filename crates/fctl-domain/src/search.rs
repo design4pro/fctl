@@ -204,7 +204,7 @@ pub fn about(title: &str, description: Option<&str>, ts: i64) -> Vec<Doc> {
 pub fn searchable(body: &EventBody) -> bool {
     match body {
         EventBody::UserMessage(m) => !m.text.trim().is_empty(),
-        EventBody::Claude(v) => reply_text(v).is_some(),
+        EventBody::Claude(v) | EventBody::Codex(v) => reply_text(v).is_some(),
         _ => false,
     }
 }

@@ -31,6 +31,7 @@ pub async fn instance(ctx: &Ctx) -> AppResult<Response> {
     http::ok(&InstanceInfo {
         name: crate::instance::name(&ctx.db, &ctx.cfg).await?,
         version: env!("CARGO_PKG_VERSION").to_owned(),
+        codex_enabled: ctx.cfg.codex_enabled.then_some(true),
         setup_required: owners.map_or(0, |c| c.n) == 0,
         features: Features {
             google: ctx.cfg.google.is_some(),

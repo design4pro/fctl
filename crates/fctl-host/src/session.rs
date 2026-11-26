@@ -331,6 +331,7 @@ pub enum SessionCmd {
     Credentials {
         request_id: Option<String>,
         claude: Option<ClaudeCredential>,
+        codex: Option<fctl_proto::runner::CodexCredential>,
         github: Option<GithubCredential>,
         github_read: Option<GithubCredential>,
         error: Option<String>,
@@ -1253,7 +1254,12 @@ async fn run(
     // after a restart may have it), kept out of what the agent sends.
     let secrets = Secrets::default();
     if let Some(spec) = &spec {
-        secrets.add(&spec.credentials.claude.access_token);
+        if let Some(token) = &spec.credentials.claude {
+            secrets.add(&token.access_token);
+        }
+        if let Some(token) = &spec.credentials.codex {
+            secrets.add(&token.access_token);
+        }
     }
     if let Ok(Some(kept)) = claude_token::load(&ctx.cfg.claude_token()) {
         secrets.add(&kept.token);
@@ -1263,13 +1269,7 @@ async fn run(
     // session runs on now, which the agent takes as its own too, so that
     // what it prints of it stays redacted (as any Claude token does by its
     // shape: `claude_token::redact_shapes`).
-    if spec.is_none() {
-        let _ = events.send(SessionEvent::CredentialRequest {
-            session_id: session_id.clone(),
-            request_id: RECOVERED_CREDENTIALS.into(),
-            kind: CredentialKind::Claude,
-        });
-    }
+    let mut recovering = spec.is_none();
     // Claude streams what it writes in pieces, which may split a token.
     let mut streaming = claude_token::StreamRedactor::default();
     let (uplink, mut down) = Uplink::start(
@@ -1419,6 +1419,8 @@ async fn run(
     let mut acked: u64 = 0;
     let mut welcomed = false;
     let mut link: Option<AgentLink> = None;
+    let mut agent_configured = false;
+    let mut codex_usage = None;
     // Frames for the agent while none is attached, in order.
     let mut queued: Vec<HostToAgent> = Vec::new();
     // Whether the attached agent takes `File` frames.
@@ -1561,7 +1563,10 @@ async fn run(
                     told_restart = true;
                 }
                 match attached {
-                    Ok(io) => link = Some(AgentLink::open(io, &sb.name, secrets.clone())),
+                    Ok(io) => {
+                        link = Some(AgentLink::open(io, &sb.name, secrets.clone()));
+                        agent_configured = false;
+                    }
                     Err(e) => {
                         tracing::warn!("attaching to {}: {e:#}", sb.name);
                         reach.down(Instant::now(), Instant::now(), format!("{e:#}"));
@@ -1612,20 +1617,41 @@ async fn run(
                             h.agent_seq
                         );
                         set_report(h.status, Some(h.agent_seq));
+                        agent_configured = h.configured;
                         agent_files = h.features.iter().any(|f| f == FEATURE_ATTACHMENTS);
                         agent_settings = h.features.iter().any(|f| f == FEATURE_SETTINGS);
                         agent_relays = h.features.iter().any(|f| f == FEATURE_CLAUDE_RELAY);
                         hello_seen = true;
+                        if spec.as_ref().is_some_and(|s| s.agent_kind == Some(fctl_proto::session::AgentKind::Codex))
+                            && !h.features.iter().any(|f| f == fctl_proto::runner::FEATURE_CODEX)
+                        {
+                            let msg = "Update the runner to start Codex sessions".to_owned();
+                            uplink.state(state(SessionStatus::Failed, &msg));
+                            break (SessionStatus::Failed, Some(msg));
+                        }
+                        if recovering && h.configured {
+                            recovering = false;
+                            let kind = if h.agent_kind == Some(fctl_proto::session::AgentKind::Codex) {
+                                CredentialKind::Codex
+                            } else {
+                                CredentialKind::Claude
+                            };
+                            let _ = events.send(SessionEvent::CredentialRequest {
+                                session_id: session_id.clone(),
+                                request_id: RECOVERED_CREDENTIALS.into(),
+                                kind,
+                            });
+                        }
                         if h.configured && h.claude_relay {
                             relaying = true;
                         }
-                        if let Some(HeldCredentials { request_id, mut claude, github, github_read, error }) = held_creds.take() {
+                        if let Some(HeldCredentials { request_id, mut claude, codex, github, github_read, error }) = held_creds.take() {
                             // No request of the agent's waits for it: a token
                             // it can't have just stays here.
                             if let Some(why) = for_agent(relaying, keeps_nothing_out(&ctx), &claude_token, &mut claude) {
                                 tracing::info!("{session_id}: {why}");
                             }
-                            l.send(HostToAgent::Credentials { request_id, claude, github, github_read, error });
+                            l.send(HostToAgent::Credentials { request_id, claude, codex, github, github_read, error });
                         }
                         // A host that restarted has no token for it yet.
                         if relaying && !claude_token.known() && !token_wanted {
@@ -1858,6 +1884,12 @@ async fn run(
                             route(delivery, &jobs, link.as_ref(), &mut queued);
                         }
                     }
+                    UplinkDown::PauseCodex { reset_at } => {
+                        codex_usage = Some(HostToAgent::PauseCodex { reset_at });
+                    }
+                    UplinkDown::ResumeCodex => {
+                        codex_usage = Some(HostToAgent::ResumeCodex);
+                    }
                     UplinkDown::Pong => {}
                 }
             }
@@ -1875,6 +1907,7 @@ async fn run(
                 files::Ready::Job(files::Job::Configure(config)) => {
                     if let Some(l) = &link {
                         l.send(HostToAgent::Configure { config });
+                        agent_configured = true;
                     }
                 }
                 files::Ready::Job(files::Job::Deliver(delivery)) => match &link {
@@ -2011,8 +2044,11 @@ async fn run(
                     }
                 }
                 Some(SessionCmd::Superseded) => superseded = true,
-                Some(SessionCmd::Credentials { request_id, mut claude, github, github_read, error }) => {
+                Some(SessionCmd::Credentials { request_id, mut claude, codex, github, github_read, error }) => {
                     if let Some(c) = &claude {
+                        secrets.add(&c.access_token);
+                    }
+                    if let Some(c) = &codex {
                         secrets.add(&c.access_token);
                     }
                     let ours = request_id.as_deref().is_some_and(|r| r.starts_with(RELAY_REQUEST));
@@ -2020,7 +2056,7 @@ async fn run(
                         token_wanted = false;
                     }
                     if !hello_seen && request_id.as_deref() == Some(RECOVERED_CREDENTIALS) {
-                        held_creds = Some(HeldCredentials { request_id, claude, github, github_read, error });
+                        held_creds = Some(HeldCredentials { request_id, claude, codex, github, github_read, error });
                     } else {
                         // The token stays here: the agent gets the stand-in,
                         // or none.
@@ -2032,7 +2068,7 @@ async fn run(
                             }
                         } else if let Some(l) = &link {
                             let error = error.or(withheld);
-                            l.send(HostToAgent::Credentials { request_id, claude, github, github_read, error });
+                            l.send(HostToAgent::Credentials { request_id, claude, codex, github, github_read, error });
                         }
                     }
                 }
@@ -2091,6 +2127,12 @@ async fn run(
                     report_reach(&uplink, r, held.as_ref());
                 }
             }
+        }
+        if agent_configured
+            && let Some(link) = &link
+            && let Some(frame) = codex_usage.take()
+        {
+            link.send(frame);
         }
     };
     if let Some(a) = attaching.take() {
@@ -2213,7 +2255,9 @@ fn relay_for(
     token: &claude_relay::Token,
     uplink: &Uplink,
 ) -> Result<Option<ClaudeRelay>, String> {
-    let cred = &spec.credentials.claude;
+    let Some(cred) = spec.credentials.claude.as_ref() else {
+        return Ok(None);
+    };
     if !cred.stand_in {
         return Ok(None);
     }
@@ -2252,6 +2296,7 @@ const RELAY_REQUEST: &str = "relay-";
 struct HeldCredentials {
     request_id: Option<String>,
     claude: Option<ClaudeCredential>,
+    codex: Option<fctl_proto::runner::CodexCredential>,
     github: Option<GithubCredential>,
     github_read: Option<GithubCredential>,
     error: Option<String>,
@@ -2347,8 +2392,10 @@ fn agent_config(
     let sandbox = ctx.driver.enforces_size().then(|| ctx.sandbox_size(spec));
     let mut spec = spec.clone();
     // The agent never gets the token the host keeps.
-    if claude_relay.is_some() {
-        spec.credentials.claude.access_token = CLAUDE_STAND_IN.to_owned();
+    if claude_relay.is_some()
+        && let Some(credential) = spec.credentials.claude.as_mut()
+    {
+        credential.access_token = CLAUDE_STAND_IN.to_owned();
     }
     AgentConfig {
         spec,

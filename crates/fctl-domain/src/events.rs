@@ -339,6 +339,13 @@ pub fn apply_stats(
                 > 0;
             stats.turn_started_at = (running && queued).then_some(ts);
         }
+        ClaudeKind::System if v.get("subtype").and_then(Value::as_str) == Some("codex_usage") => {
+            if let (Some(id), Some(usage)) =
+                (v.get("call_id").and_then(Value::as_str), v.get("usage"))
+            {
+                count_call(stats, counted, Some(id), usage, true, true);
+            }
+        }
         // Claude compacted the conversation: its context holds what the
         // compaction left (absent from Claude Code before `post_tokens`)
         // until the next call says.

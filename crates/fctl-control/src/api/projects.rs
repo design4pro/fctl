@@ -101,6 +101,16 @@ fn clean_settings(mut s: ProjectSettings) -> AppResult<ProjectSettings> {
             Some(validate::effort(e)?)
         };
     }
+    if let Some(model) = s.codex_model.as_deref() {
+        s.codex_model = (!model.trim().is_empty())
+            .then(|| validate::model(model))
+            .transpose()?;
+    }
+    if let Some(effort) = s.codex_effort.as_deref() {
+        s.codex_effort = (!effort.trim().is_empty())
+            .then(|| validate::codex_effort(effort))
+            .transpose()?;
+    }
     if let Some(script) = s.setup_script.as_deref() {
         let t = validate::text("settings.setup_script", script, 20_000)?;
         s.setup_script = (!t.is_empty()).then_some(t);

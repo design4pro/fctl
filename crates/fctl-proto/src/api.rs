@@ -30,6 +30,9 @@ use std::collections::BTreeMap;
 pub struct InstanceInfo {
     pub name: String,
     pub version: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts", ts(optional))]
+    pub codex_enabled: Option<bool>,
     /// No owner yet: the setup link must be used first.
     pub setup_required: bool,
     pub features: Features,
@@ -3613,6 +3616,7 @@ pub struct CreateSessionRequest {
     pub branch: Option<String>,
     pub model: Option<String>,
     pub effort: Option<String>,
+    pub agent_kind: Option<crate::session::AgentKind>,
     /// Files to send with it: ids from `POST /api/v1/projects/{id}/attachments`.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     #[cfg_attr(feature = "ts", ts(as = "Option<Vec<AttachmentId>>", optional))]
@@ -3918,6 +3922,7 @@ pub struct ReviewAgents {
     pub model: Option<String>,
     /// Their effort level; absent: the project's.
     pub effort: Option<String>,
+    pub agent_kind: Option<crate::session::AgentKind>,
     /// What they are told besides fctl's own review instructions.
     pub instructions: Option<String>,
     /// The GitHub Apps whose pull requests start reviews by themselves, as
@@ -3982,6 +3987,7 @@ pub struct UpdateReviewAgentsRequest {
     pub model: Option<String>,
     /// An effort level; `""` for the project's.
     pub effort: Option<String>,
+    pub agent_kind: Option<crate::session::AgentKind>,
     /// `""` for none.
     pub instructions: Option<String>,
     /// The GitHub Apps whose pull requests start reviews by themselves, in
@@ -4433,6 +4439,7 @@ pub struct Schedule {
     /// What its sessions start with; absent: the project's.
     pub model: Option<String>,
     pub effort: Option<String>,
+    pub agent_kind: Option<crate::session::AgentKind>,
     pub base_branch: Option<String>,
     /// What its sessions' agents may do on GitHub: what it set, else
     /// `triage` for a schedule anyone on GitHub can start (issues opened,
@@ -4802,6 +4809,7 @@ pub struct CreateScheduleRequest {
     pub timezone: Option<String>,
     pub model: Option<String>,
     pub effort: Option<String>,
+    pub agent_kind: Option<crate::session::AgentKind>,
     pub base_branch: Option<String>,
     /// At most what the project allows; absent: its default, `triage` on
     /// an event anyone on GitHub can start (issues opened, pull requests
@@ -4836,6 +4844,7 @@ pub struct UpdateScheduleRequest {
     pub model: Option<String>,
     /// `""` for the project's.
     pub effort: Option<String>,
+    pub agent_kind: Option<crate::session::AgentKind>,
     /// `""` for the project's default branch.
     pub base_branch: Option<String>,
     /// `push`, `comment`, `triage` or `read`; `""` for its default:

@@ -42,6 +42,8 @@ pub struct Instance {
     /// never app.fctl.sh's.
     #[serde(default)]
     pub admin_tokens: bool,
+    #[serde(default)]
+    pub codex_enabled: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -168,6 +170,9 @@ impl Instance {
         }
         if self.admin_tokens {
             vars.push(("FCTL_ADMIN_TOKENS", "1".to_owned()));
+        }
+        if self.codex_enabled {
+            vars.push(("FCTL_CODEX_ENABLED", "1".to_owned()));
         }
         // The Worker runs first for the app's files too, to redirect them;
         // otherwise Cloudflare serves them itself, over http as well, and
@@ -596,6 +601,20 @@ client_id = "lin_client"
         let example: toml::Table =
             toml::from_str(&load(&root, "example").unwrap().wrangler_toml()).unwrap();
         assert!(example["vars"].get("FCTL_SEARCH_ENGINES").is_none());
+    }
+
+    #[test]
+    fn codex_is_opt_in_on_private_instances() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
+        let hosted: toml::Table =
+            toml::from_str(&load(&root, "fctl-sh").unwrap().wrangler_toml()).unwrap();
+        let mut example = load(&root, "example").unwrap();
+        let default: toml::Table = toml::from_str(&example.wrangler_toml()).unwrap();
+        assert!(hosted["vars"].get("FCTL_CODEX_ENABLED").is_none());
+        assert!(default["vars"].get("FCTL_CODEX_ENABLED").is_none());
+        example.codex_enabled = true;
+        let enabled: toml::Table = toml::from_str(&example.wrangler_toml()).unwrap();
+        assert_eq!(enabled["vars"]["FCTL_CODEX_ENABLED"].as_str(), Some("1"));
     }
 
     /// Search engines take a site's favicon from its home page's head, and

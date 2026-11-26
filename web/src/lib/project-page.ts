@@ -138,12 +138,14 @@ const count = (n: number, one: string, many: string) => (n === 1 ? `1 ${one}` : 
  * "Claude's default model · compacts near 400K".
  */
 export function agentsGist(s: G.ProjectSettings): string {
-  const model = s.model?.trim();
-  const effort = s.effort?.trim();
+  const codex = s.agent_kind === "codex";
+  const model = (codex ? s.codex_model : s.model)?.trim();
+  const effort = (codex ? s.codex_effort : s.effort)?.trim();
   return [
-    model ? modelLabel(model) : "Claude's default model",
-    effort && `${effortLabel(effort).toLowerCase()} effort`,
-    compactGist(s),
+    codex && model && "Codex",
+    model ? modelLabel(model, s.agent_kind) : `${modelLabel("", s.agent_kind)} model`,
+    effort && `${effortLabel(effort, s.agent_kind).toLowerCase()} effort`,
+    !codex && compactGist(s),
   ]
     .filter(Boolean)
     .join(" · ");

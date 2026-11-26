@@ -93,6 +93,15 @@ pub fn for_new_project(settings: &mut ProjectSettings, sent: &Value) {
 /// (send `null` for none). `sent` is the update's `settings` object as it
 /// arrived.
 pub fn keep_unsent(settings: &mut ProjectSettings, stored: &ProjectSettings, sent: &Value) {
+    if sent.get("agent_kind").is_none() {
+        settings.agent_kind = stored.agent_kind;
+    }
+    if sent.get("codex_model").is_none() {
+        settings.codex_model.clone_from(&stored.codex_model);
+    }
+    if sent.get("codex_effort").is_none() {
+        settings.codex_effort.clone_from(&stored.codex_effort);
+    }
     let follow_ups = sent.get("follow_ups");
     let unsent = |key: &str| follow_ups.and_then(|f| f.get(key)).is_none();
     if unsent("comments") {

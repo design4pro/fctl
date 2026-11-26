@@ -97,6 +97,7 @@
 //! end. Its `system/init` says that effort changes keep the prompt cache
 //! (`per_turn_effort_active`), as Claude Code 2.1.318 does on Opus 5.5.
 
+mod codex;
 mod replay;
 
 /// A model by its ID, as Claude Code names the model an alias stands for.
@@ -2251,6 +2252,18 @@ fn rename_to(text: &str) -> Option<String> {
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
+    if args
+        .first()
+        .and_then(|arg| std::path::Path::new(arg).file_name())
+        .is_some_and(|name| name == "codex")
+        || args.iter().any(|arg| arg == "app-server")
+    {
+        if let Err(error) = codex::run(&args) {
+            eprintln!("{error}");
+            std::process::exit(1);
+        }
+        return;
+    }
     let arg = |name: &str| {
         args.iter()
             .position(|a| a == name)

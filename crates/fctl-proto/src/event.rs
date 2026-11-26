@@ -40,6 +40,23 @@ pub enum EventBody {
         )]
         serde_json::Value,
     ),
+    /// Codex messages projected onto fctl's transcript message format.
+    Codex(
+        #[cfg_attr(
+            feature = "ts",
+            ts(type = "import('../lib/claude-types').ClaudeMessage")
+        )]
+        serde_json::Value,
+    ),
+    /// The ChatGPT plan or app allowance for this connection was reached.
+    CodexLimit {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[cfg_attr(feature = "ts", ts(optional))]
+        credential_id: Option<crate::CredentialId>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[cfg_attr(feature = "ts", ts(optional))]
+        reset_at: Option<Millis>,
+    },
     /// A person (or automation) wrote to the agent.
     UserMessage(UserMessage),
     /// The session changed state.
@@ -62,6 +79,8 @@ impl EventBody {
     pub fn kind(&self) -> &'static str {
         match self {
             Self::Claude(_) => "claude",
+            Self::Codex(_) => "codex",
+            Self::CodexLimit { .. } => "codex_limit",
             Self::UserMessage(_) => "user_message",
             Self::Status(_) => "status",
             Self::Log(_) => "log",

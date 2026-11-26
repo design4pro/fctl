@@ -87,6 +87,10 @@ pub struct ControlState {
     /// runs it on the resumer's. Its Remote Control links are theirs.
     #[serde(default)]
     pub claude_user: Option<UserRef>,
+    #[serde(default)]
+    pub codex_user: Option<UserRef>,
+    #[serde(default)]
+    pub codex_usage_changed: Option<String>,
     /// How short of disk the session's runner is now, from FleetObject
     /// (`fctl_domain::disk::heard`). A new runner clears what the last one
     /// said.

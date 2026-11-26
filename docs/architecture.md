@@ -4561,6 +4561,22 @@ what happens to as it happens, signed with each one's secret
    log, and its own webhooks whole (`/forget-project`, with their ids
    read before their rows cascade).
 
+## Codex credentials
+
+On an instance someone runs with `FCTL_CODEX_ENABLED=1`, `fctl codex connect`
+uses Sign in with ChatGPT, with PKCE and a loopback callback in the CLI.
+The control plane validates the identity and the plan grant, and stores
+encrypted credentials for the user's default or workspace connection.
+An assigned runner gets only the short-lived access token.
+
+The supervisor starts Codex App Server over stdio. Its local Responses API
+relay supplies the token, reads usage-limit errors and streams replies into
+the session transcript. Stopped sessions resume the saved Codex thread,
+including its history in a conversation snapshot. Each session keeps its
+chosen agent. The operator selects the agent for schedules, reviews and
+autopilots. [ADR 0102](adr/0102-sessions-can-run-codex-on-a-chatgpt-plan.md)
+records the protocol, billing and deployment choices.
+
 ## Claude credentials
 
 Each user connects their own Claude subscription; a session always runs on

@@ -509,7 +509,7 @@ impl DurableObject for SessionObject {
             }
             (worker::Method::Get, "/diff") => self.diff(&req),
             (worker::Method::Get, "/viewer") => return self.accept_viewer(&req),
-            (worker::Method::Get, "/uplink") => return self.accept_uplink(&req),
+            (worker::Method::Get, "/uplink") => return self.accept_uplink(&req).await,
             (worker::Method::Post, "/purge") => self.purge().await,
             (worker::Method::Post, "/index") => {
                 self.backfill_search().await.map(|d| serde_json::json!(d))
@@ -2231,6 +2231,22 @@ impl SessionObject {
     }
 
     async fn control(&self, b: ControlState) -> std::result::Result<serde_json::Value, ApiError> {
+        if let Some(credential_id) = &b.codex_usage_changed
+            && let Some(s) = self.summary()
+            && s.agent_kind == Some(fctl_proto::session::AgentKind::Codex)
+        {
+            let db = self
+                .env
+                .d1("DB")
+                .map_err(|e| api_err(ErrorCode::Internal, &e.to_string()))?;
+            let usage = crate::spec::codex_usage_for_session(&db, s.id.as_str(), now_ms())
+                .await
+                .map_err(|e| e.0)?;
+            if let Some(usage) = usage.filter(|usage| &usage.credential_id == credential_id) {
+                self.send_checked_uplink(&usage.frame(), now_ms()).await;
+            }
+            return Ok(serde_json::json!({ "ok": true }));
+        }
         let Some(mut s) = self.summary() else {
             return Err(api_err(ErrorCode::NotFound, "Session not initialized"));
         };
@@ -2258,6 +2274,10 @@ impl SessionObject {
         {
             self.set_meta("claude_user", &json);
             s.claude = Some(u);
+        }
+        if let Some(u) = b.codex_user {
+            s.codex = Some(u);
+            described = true;
         }
         let new_runner = b.runner.is_some() || b.clear_runner;
         if let Some(r) = b.runner {
@@ -2770,9 +2790,23 @@ impl SessionObject {
         serde_json::json!({ "ok": true })
     }
 
-    fn accept_uplink(&self, req: &Request) -> Result<Response> {
+    async fn accept_uplink(&self, req: &Request) -> Result<Response> {
         let Some(runner_id) = crate::http::header(req, internal::HDR_RUNNER) else {
             return internal::do_error(&api_err(ErrorCode::Unauthorized, "No runner identity"));
+        };
+        let now = now_ms();
+        let usage = if let Some(session) = self
+            .summary()
+            .filter(|s| s.agent_kind == Some(fctl_proto::session::AgentKind::Codex))
+        {
+            let db = self.env.d1("DB")?;
+            let result = crate::spec::codex_usage_for_session(&db, session.id.as_str(), now).await;
+            match result {
+                Ok(usage) => usage,
+                Err(error) => return internal::do_error(&error.0),
+            }
+        } else {
+            None
         };
         for old in self.state.get_websockets_with_tag(TAG_UPLINK) {
             let _ = old.close(Some(4001), Some("replaced by a newer connection"));
@@ -2781,7 +2815,6 @@ impl SessionObject {
         self.state
             .accept_websocket_with_tags(&pair.server, &[TAG_UPLINK]);
         // The Worker checked it just now (`api::runners::uplink`).
-        let now = now_ms();
         pair.server.serialize_attachment(&SocketInfo {
             runner_id: Some(runner_id),
             since: now,
@@ -2789,6 +2822,11 @@ impl SessionObject {
             runner_token: crate::http::header(req, internal::HDR_RUNNER_TOKEN),
             ..Default::default()
         })?;
+        if let Some(usage) = usage
+            && let Ok(text) = serde_json::to_string(&usage.frame())
+        {
+            pair.server.send_with_str(&text)?;
+        }
         let pending: Vec<Delivery> = self
             .sql
             .exec("SELECT data FROM outbox ORDER BY n ASC", None)
@@ -2970,19 +3008,43 @@ impl SessionObject {
                     // Claude's thinking progress is only live, but older
                     // agents store it, about once a second: acknowledged
                     // and dropped.
-                    if let EventBody::Claude(v) = &body
+                    let is_claude = matches!(&body, EventBody::Claude(_));
+                    let is_codex = summary.as_ref().is_some_and(|s| {
+                        s.agent_kind == Some(fctl_proto::session::AgentKind::Codex)
+                    });
+                    if (is_codex
+                        && matches!(&body, EventBody::Claude(_) | EventBody::RemoteControl(_)))
+                        || (!is_codex
+                            && matches!(&body, EventBody::Codex(_) | EventBody::CodexLimit { .. }))
+                    {
+                        continue;
+                    }
+                    if let EventBody::CodexLimit {
+                        credential_id,
+                        reset_at,
+                    } = &mut body
+                        && let Some(credential_id) = credential_id.take()
+                    {
+                        self.record_codex_limit(credential_id.as_str(), *reset_at, now)
+                            .await;
+                    }
+                    if let EventBody::Claude(v) | EventBody::Codex(v) = &body
                         && ev::is_ephemeral(ev::classify(v))
                     {
                         continue;
                     }
-                    if let (EventBody::Claude(v), Some(s)) = (&mut body, summary.as_mut()) {
+                    if let (EventBody::Claude(v) | EventBody::Codex(v), Some(s)) =
+                        (&mut body, summary.as_mut())
+                    {
                         summary_changed |= Self::apply_claude(s, &mut counted, v, e.ts, &self.mem);
                         turn_ended |= self.remember_reply(v, e.agent_seq, crew(s));
                         ran_merge |= follow_ups::merges_or_closes(v);
                         self.mirror_to_linear(s, v, now);
-                        plan::merge(&mut usage, plan::readings(v, now));
-                        listed = plan::listed(v).or(listed);
-                        claude_seen.note(v);
+                        if is_claude {
+                            plan::merge(&mut usage, plan::readings(v, now));
+                            listed = plan::listed(v).or(listed);
+                            claude_seen.note(v);
+                        }
                         kept_some |= self.keep_images(v, now);
                         ev::shape_for_storage(v);
                     }
@@ -5388,9 +5450,44 @@ impl SessionObject {
         });
     }
 
+    async fn record_codex_limit(&self, credential_id: &str, reset_at: Option<i64>, now: i64) {
+        let Some(session) = self.summary() else {
+            return;
+        };
+        let result = async {
+            let db = self.env.d1("DB")?;
+            if let Some(row) = crate::spec::session_row(&db, session.id.as_str()).await?
+                && row.agent() == fctl_proto::session::AgentKind::Codex
+                && row.credential_id.as_deref() == Some(credential_id)
+            {
+                let reset_at = reset_at.filter(|at| *at > now && *at < now + 8 * 86_400_000);
+                crate::codex::pause(&db, credential_id, reset_at).await?;
+                let env = self.env.clone();
+                let credential_id = credential_id.to_owned();
+                self.state.wait_until(async move {
+                    if let Err(error) = crate::codex::notify_usage_changed(
+                        &env,
+                        &db,
+                        &credential_id,
+                        Some(session.id.as_str()),
+                    )
+                    .await
+                    {
+                        worker::console_error!("notifying Codex sessions: {}", error.0.message);
+                    }
+                });
+            }
+            Ok::<_, crate::error::AppError>(())
+        }
+        .await;
+        if let Err(error) = result {
+            worker::console_error!("recording a ChatGPT usage limit: {}", error.0.message);
+        }
+    }
+
     fn pulse(&self, body: &EventBody, now: i64) {
         let (kind, weight) = match body {
-            EventBody::Claude(v) => match ev::activity(v) {
+            EventBody::Claude(v) | EventBody::Codex(v) => match ev::activity(v) {
                 Some(kw) => kw,
                 None => return,
             },

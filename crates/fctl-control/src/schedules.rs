@@ -16,9 +16,7 @@
 use crate::access;
 use crate::db::{int, int_bool, n, on, opt_int, os, q, s};
 use crate::error::{AppError, AppResult};
-use crate::model::{
-    CredentialRow, PROJECT_SELECT, ProjectRow, USAGE_JSON, UserRow, plan_usage, user_columns,
-};
+use crate::model::{PROJECT_SELECT, ProjectRow, USAGE_JSON, UserRow, plan_usage, user_columns};
 use fctl_domain::cron::{self, Zone};
 use fctl_domain::hooks::Kind;
 use fctl_domain::schedules::{self as sch, RunNote, StartedBy, When};
@@ -142,6 +140,8 @@ pub fn zone(name: &str) -> Box<dyn Zone> {
 /// A schedule, as D1 keeps it, with its people's names.
 #[derive(Clone, Debug, Deserialize)]
 pub struct ScheduleRow {
+    #[serde(default)]
+    pub agent_kind: Option<fctl_proto::session::AgentKind>,
     pub id: String,
     pub project_id: String,
     pub name: String,
@@ -184,7 +184,7 @@ pub struct ScheduleRow {
 
 /// SELECT for [`ScheduleRow`]; `WHERE` and `ORDER BY` follow.
 pub const SCHEDULE_SELECT: &str = "SELECT sc.id, sc.project_id, sc.name, sc.prompt, sc.cron, sc.at, sc.event_kind, sc.event_filter, sc.timezone, \
-    sc.model, sc.effort, sc.base_branch, sc.github_access, sc.hide_sessions, sc.owner_id, ou.name AS owner_name, \
+    sc.model, sc.effort, sc.agent_kind, sc.base_branch, sc.github_access, sc.hide_sessions, sc.owner_id, ou.name AS owner_name, \
     ou.avatar_url AS owner_avatar, sc.enabled, sc.paused_reason, sc.next_run_at, \
     sc.created_by, cu.name AS creator_name, cu.avatar_url AS creator_avatar, sc.created_at, \
     sc.updated_by, uu.name AS updater_name, uu.avatar_url AS updater_avatar, sc.updated_at \
@@ -342,6 +342,7 @@ impl ScheduleRow {
             timezone: self.timezone.clone(),
             model: self.model.clone(),
             effort: self.effort.clone(),
+            agent_kind: self.agent_kind,
             base_branch: self.base_branch.clone(),
             github_access: self.run_github(),
             hide_sessions: self.hide_sessions,
@@ -548,7 +549,7 @@ pub async fn previous(db: &D1Database, schedule_id: &str) -> AppResult<Option<Pr
 /// Who a schedule runs for, and their Claude connection.
 pub struct Owner {
     pub user: UserRow,
-    pub credential: CredentialRow,
+    pub credential: crate::api::sessions::SessionConnection,
 }
 
 /// The person a schedule runs for and their Claude connection for the
@@ -593,14 +594,43 @@ pub async fn owner(
             "It runs on {name}'s Claude subscription, and {name} can no longer start sessions in this project."
         )));
     }
+    let agent = row.agent_kind.unwrap_or_default();
     let credential =
-        crate::api::sessions::credential_for(db, &user, project.workspace_id()).await?;
+        crate::api::sessions::connection_for(db, &user, project.workspace_id(), agent).await?;
     let Some(credential) = credential else {
+        if agent == fctl_proto::session::AgentKind::Codex {
+            return Ok(Err(format!(
+                "{name} needs to connect a ChatGPT plan to run this schedule."
+            )));
+        }
         return Ok(Err(format!(
             "It runs on {name}'s Claude subscription, and {name} has no Claude connection to run it on."
         )));
     };
     Ok(Ok(Owner { user, credential }))
+}
+
+/// When to recheck the stored ChatGPT limit. A limit without a reset does
+/// not cause new inference requests while we wait for the owner to retry it.
+pub(crate) async fn codex_recheck_at(
+    db: &D1Database,
+    connection: &crate::api::sessions::SessionConnection,
+    now: i64,
+) -> AppResult<Option<i64>> {
+    if connection.agent != fctl_proto::session::AgentKind::Codex {
+        return Ok(None);
+    }
+    #[derive(Deserialize)]
+    struct Block {
+        #[serde(deserialize_with = "opt_int", default)]
+        reset_at: Option<i64>,
+    }
+    let blocked: Option<Block> = q(
+        db,
+        "SELECT reset_at FROM codex_credentials WHERE id = ?1 AND paused = 1 AND (reset_at IS NULL OR reset_at > ?2)",
+        &[s(&connection.id), n(now)],
+    )?.first().await?;
+    Ok(blocked.map(|block| block.reset_at.unwrap_or(now + cron::MINUTE_MS)))
 }
 
 /// The latest plan usage of a Claude connection.
@@ -619,11 +649,13 @@ pub async fn usage_of(db: &D1Database, credential_id: &str) -> AppResult<Vec<Pla
     Ok(plan_usage(row.and_then(|r| r.usage).as_deref()))
 }
 
+type ScheduleOwnerUsage = Result<(String, Vec<PlanLimit>, bool), String>;
+
 /// Why schedules that are on wouldn't start their next run now, for a list
 /// of them: each owner looked up once.
 #[derive(Default)]
 pub struct Problems {
-    owners: HashMap<String, Result<(String, Vec<PlanLimit>), String>>,
+    owners: HashMap<(String, &'static str), ScheduleOwnerUsage>,
     /// The kinds of events that wouldn't start the project's runs, and why
     /// (`crate::triggers::unheard`).
     pub unheard: Vec<fctl_proto::api::UnheardEvent>,
@@ -637,11 +669,19 @@ impl Problems {
         db: &D1Database,
         project: &ProjectRow,
         row: &ScheduleRow,
-    ) -> AppResult<&Result<(String, Vec<PlanLimit>), String>> {
-        let key = row.owner_id.clone().unwrap_or_default();
+        now: i64,
+    ) -> AppResult<&ScheduleOwnerUsage> {
+        let key = (
+            row.owner_id.clone().unwrap_or_default(),
+            row.agent_kind.unwrap_or_default().as_str(),
+        );
         if !self.owners.contains_key(&key) {
             let found = match owner(db, project, row).await? {
-                Ok(o) => Ok((o.user.name.clone(), usage_of(db, &o.credential.id).await?)),
+                Ok(o) => Ok((
+                    o.user.name,
+                    usage_of(db, &o.credential.id).await?,
+                    codex_recheck_at(db, &o.credential, now).await?.is_some(),
+                )),
                 Err(why) => Err(why),
             };
             self.owners.insert(key.clone(), found);
@@ -671,9 +711,12 @@ impl Problems {
         }
         let zone = zone(&row.timezone);
         let when = row.when();
-        Ok(match self.owner_of(db, project, row).await? {
+        Ok(match self.owner_of(db, project, row, now).await? {
             Err(why) => Some(format!("{why} Its next run pauses it.")),
-            Ok((name, limits)) => match (sch::at_limit(limits, next.max(now)), when) {
+            Ok((name, _, true)) => Some(format!(
+                "{name}'s ChatGPT connection is at its usage limit."
+            )),
+            Ok((name, limits, false)) => match (sch::at_limit(limits, next.max(now)), when) {
                 (Some(limit), Some(When::At(_))) => Some(format!(
                     "{} It starts once the limit resets.",
                     sch::limit_reason(name, limit, &*zone, true)
@@ -683,10 +726,15 @@ impl Problems {
                     sch::limit_reason(name, limit, &*zone, true)
                 )),
                 // It ran once, at a time the plan was at its limit.
-                (None, Some(When::At(at))) if next > at + cron::MINUTE_MS => Some(format!(
-                    "{name}'s Claude plan was at its limit at its time, so it waits for the limit to reset: it starts on {}.",
-                    sch::stamp(&*zone, next)
-                )),
+                (None, Some(When::At(at)))
+                    if next > at + cron::MINUTE_MS
+                        && row.agent_kind != Some(fctl_proto::session::AgentKind::Codex) =>
+                {
+                    Some(format!(
+                        "{name}'s Claude plan was at its limit at its time, so it waits for the limit to reset: it starts on {}.",
+                        sch::stamp(&*zone, next)
+                    ))
+                }
                 (None, _) => None,
             },
         })
@@ -720,9 +768,12 @@ impl Problems {
             return Ok(Some(u.reason.clone()));
         }
         let zone = zone(&row.timezone);
-        let plan = match self.owner_of(db, project, row).await? {
+        let plan = match self.owner_of(db, project, row, now).await? {
             Err(why) => Some(format!("{why} The next event pauses it.")),
-            Ok((name, limits)) => sch::at_limit(limits, now).map(|limit| {
+            Ok((name, _, true)) => Some(format!(
+                "{name}'s ChatGPT connection is at its usage limit."
+            )),
+            Ok((name, limits, false)) => sch::at_limit(limits, now).map(|limit| {
                 format!(
                     "{} The events until then start no run.",
                     sch::limit_reason(name, limit, &*zone, true)
@@ -904,6 +955,17 @@ async fn run(env: &Env, db: &D1Database, c: Claimed<'_>) -> AppResult<Option<Out
                 break 'run skip(why);
             }
         };
+        if let Some(recheck) = codex_recheck_at(db, &owner.credential, now).await? {
+            if matches!(when, When::At(_)) {
+                q(
+                    db,
+                    "UPDATE schedules SET next_run_at = ? WHERE id = ? AND enabled = 1 AND next_run_at IS NULL",
+                    &[n(recheck), s(&row.id)],
+                )?.run().await?;
+                return Ok(None);
+            }
+            break 'run skip("The owner's ChatGPT connection is at its usage limit.".into());
+        }
         let limits = usage_of(db, &owner.credential.id).await?;
         if let Some(limit) = sch::at_limit(&limits, now) {
             // Readings come from sandboxes: a reset more than a week ahead
@@ -1225,7 +1287,7 @@ pub struct Start<'a> {
     pub schedule: &'a ScheduleRow,
     /// Who it runs as, on which Claude connection.
     pub user: &'a UserRow,
-    pub credential: &'a CredentialRow,
+    pub credential: &'a crate::api::sessions::SessionConnection,
     pub github_access: GithubAccess,
     /// Its first message: the task and what the run is.
     pub prompt: String,
@@ -1450,6 +1512,73 @@ mod tests {
         .first()
         .await?;
         assert_eq!(kept.map(|c| c.n), Some(sch::RUNS_KEPT));
+        Ok(())
+    }
+
+    #[wasm_bindgen_test]
+    async fn codex_schedule_uses_its_owners_chatgpt_connection_and_limit() -> AppResult<()> {
+        use fctl_proto::session::AgentKind;
+
+        let db = testing::database();
+        for sql in [
+            "INSERT INTO users (id, email, name, created_at, updated_at) VALUES ('usr_ada', 'ada@example.com', 'Ada', 0, 0)",
+            "INSERT INTO workspaces (id, slug, name, created_at, updated_at) VALUES ('wsp_acme', 'acme', 'Acme', 0, 0)",
+            "INSERT INTO workspace_members (workspace_id, user_id, email, role, created_at)
+             VALUES ('wsp_acme', 'usr_ada', 'ada@example.com', 'owner', 0)",
+            "INSERT INTO projects (id, slug, name, created_by, created_at, updated_at, workspace_id)
+             VALUES ('prj_web', 'web', 'Web', 'usr_ada', 0, 0, 'wsp_acme')",
+            "INSERT INTO claude_credentials (id, user_id, kind, secret_enc, created_at, updated_at)
+             VALUES ('crd_ada', 'usr_ada', 'oauth', 'sealed', 0, 0)",
+            "UPDATE users SET default_credential_id = 'crd_ada' WHERE id = 'usr_ada'",
+            "INSERT INTO schedules (id, project_id, name, prompt, owner_id, created_at, updated_at, agent_kind)
+             VALUES ('sch_ship', 'prj_web', 'Ship main', 'Ship main.', 'usr_ada', 0, 0, 'codex')",
+        ] {
+            q(&db, sql, &[])?.run().await?;
+        }
+        let project: ProjectRow = q(
+            &db,
+            &format!("{PROJECT_SELECT} WHERE p.id = ?2"),
+            &[s("usr_ada"), s("prj_web")],
+        )?
+        .first()
+        .await?
+        .ok_or_else(|| crate::error::internal("no project"))?;
+        let schedule = row(&db, "sch_ship")
+            .await?
+            .ok_or_else(|| crate::error::internal("no schedule"))?;
+        assert_eq!(
+            schedule.to_api(None, None).agent_kind,
+            Some(AgentKind::Codex)
+        );
+        assert!(
+            owner(&db, &project, &schedule)
+                .await?
+                .is_err_and(|why| why.contains("ChatGPT plan"))
+        );
+
+        let now = 1_790_000_000_000;
+        let keys = crate::crypto::Keys::derive(&[42; 32]);
+        let link = crate::codex::dev_seed(&db, &keys, "usr_ada", now).await?;
+        let owner = owner(&db, &project, &schedule)
+            .await?
+            .map_err(crate::error::internal)?;
+        assert_eq!(owner.user.id, "usr_ada");
+        assert_eq!(owner.credential.agent, AgentKind::Codex);
+        assert_eq!(owner.credential.id, link.id.as_str());
+        assert_eq!(codex_recheck_at(&db, &owner.credential, now).await?, None);
+
+        let reset = now + 5 * cron::MINUTE_MS;
+        crate::codex::pause(&db, link.id.as_str(), Some(reset)).await?;
+        assert_eq!(
+            codex_recheck_at(&db, &owner.credential, now).await?,
+            Some(reset)
+        );
+        assert_eq!(codex_recheck_at(&db, &owner.credential, reset).await?, None);
+        crate::codex::pause(&db, link.id.as_str(), None).await?;
+        assert_eq!(
+            codex_recheck_at(&db, &owner.credential, reset).await?,
+            Some(reset + cron::MINUTE_MS)
+        );
         Ok(())
     }
 }

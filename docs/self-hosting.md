@@ -145,6 +145,7 @@ Docker and Kubernetes secrets do.
 | `FCTL_WEBHOOK_PRIVATE_HOSTS` | none | IP ranges and host names on your network that webhooks may post to ([webhooks to your own network](#webhooks-to-your-own-network)) |
 | `FCTL_WEBHOOK_HTTP` | `0` | `1` lets webhooks post over plain `http://` ([webhooks to your own network](#webhooks-to-your-own-network)) |
 | `FCTL_ADMIN_TOKENS` | `0` | `1` lets instance admins make admin tokens, which create and change people's accounts ([admin tokens](#provision-people-with-admin-tokens)) |
+| `FCTL_CODEX_ENABLED` | `0` | `1` enables Codex with a ChatGPT plan ([enable Codex](#enable-codex)) |
 | `FCTL_METRICS_TOKEN` | none | The bearer token Prometheus scrapes runner pools' demand with at `/api/v1/metrics`; none, no metrics ([runner pools in Prometheus](#runner-pools-in-prometheus)) |
 | `GITHUB_APP_ID`, `GITHUB_APP_SLUG`, `GITHUB_CLIENT_ID`, `GITHUB_DEFAULT_OWNER`, `GITHUB_APP_PRIVATE_KEY`, `GITHUB_CLIENT_SECRET`, `GITHUB_WEBHOOK_SECRET` | | [The GitHub App](#connect-github-optional-recommended) |
 | `GITHUB_REVIEW_APP_ID`, `GITHUB_REVIEW_APP_SLUG`, `GITHUB_REVIEW_APP_PRIVATE_KEY` | | [The app review agents post as](#a-review-app-optional) |
@@ -1275,6 +1276,24 @@ access page where there is one), `/llms.txt`, `/sitemap.xml`, `/favicon.ico`,
 and `/apple-touch-icon.png`, and names `/sitemap.xml`, which lists the
 pages, for Google Search Console and the like.
 Everything else stays disallowed, and needs signing in anyway.
+
+## Enable Codex
+
+Set `FCTL_CODEX_ENABLED=1` for the standalone server (including in the
+environment that runs Docker Compose). On Cloudflare, set
+`codex_enabled = true` in your file in `deploy/instances` and deploy.
+Upgrade the runners and use the matching sandbox image. This uses OpenAI's
+[open-source Sign in with ChatGPT flow](https://developers.openai.com/siwc/token-sharing-open-source).
+For plan-only usage, disable additional credits for apps in
+[ChatGPT usage settings](https://chatgpt.com/settings/usage), or ask the
+ChatGPT workspace admin to disable access to workspace credits.
+
+Sign in to your instance with `fctl login`, then run `fctl codex connect`
+on the computer that opens the browser. Grant access to the ChatGPT plan.
+Use Settings → Codex to choose a default or workspace connection.
+Run `fctl run --project <project> --agent codex <task>` or choose Codex in
+the web composer. An operator can pick Codex in schedule, review and
+autopilot settings.
 
 ## Bring runners online
 

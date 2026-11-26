@@ -6,6 +6,7 @@ mod api;
 mod auth;
 mod autopilots;
 mod claude_oversight;
+mod codex;
 mod config;
 mod crypto;
 mod ctx;
@@ -236,6 +237,7 @@ async fn dispatch(
     use Method::*;
     match (method, segs) {
         (Get, ["instance"]) => api::auth::instance(ctx).await,
+        (Post, ["dev", "codex"]) => api::codex::dev_seed(ctx).await,
         (Post, ["setup"]) => api::auth::setup(ctx, req).await,
         (Get, ["invites", token]) => api::auth::invite_preview(ctx, token).await,
         (Post, ["access-requests"]) => api::early_access::request(ctx, req).await,
@@ -671,6 +673,16 @@ async fn dispatch(
             api::claude::submit_code(ctx, req, id).await
         }
         (Post, ["me", "claude", id, "default"]) => api::claude::set_default(ctx, id).await,
+        // Codex connections
+        (Get, ["me", "codex"]) => api::codex::settings(ctx).await,
+        (Post, ["me", "codex", "login", "start"]) => api::codex::login_start(ctx, req).await,
+        (Post, ["me", "codex", "login", "finish"]) => api::codex::login_finish(ctx, req).await,
+        (Put, ["me", "codex", "default"]) => api::codex::select(ctx, req, None).await,
+        (Put, ["me", "codex", "workspaces", workspace]) => {
+            api::codex::select(ctx, req, Some(workspace)).await
+        }
+        (Post, ["me", "codex", id, "retry"]) => api::codex::retry(ctx, id).await,
+        (Delete, ["me", "codex", id]) => api::codex::revoke(ctx, id).await,
         // Linear accounts
         (Get, ["me", "linear"]) => api::linear::mine(ctx).await,
         (Delete, ["me", "linear", organization]) => api::linear::unlink(ctx, organization).await,

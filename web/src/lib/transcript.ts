@@ -83,8 +83,8 @@ export type Item =
   | (Base & { kind: "git"; git: G.GitState; repos: (string | undefined)[] })
   | (Base & { kind: "remote"; rc: G.RemoteControlState })
   | (Base & { kind: "interrupt"; by?: G.UserRef })
-  /** Claude Code started, in `cwd`. */
-  | (Base & { kind: "init"; model: string; version?: string; cwd?: string })
+  | (Base & { kind: "init"; model: string; version?: string; cwd?: string; agent?: G.AgentKind })
+  | (Base & { kind: "codex_limit"; resetsAt?: number })
   | (Base & { kind: "limit"; status: string; resetsAt?: number; limit?: string });
 
 export type Tool = Extract<Item, { kind: "tool" }>;
@@ -425,12 +425,16 @@ export class TranscriptBuilder {
         items.push({ ...base, kind: "interrupt", key: `i-${ev.seq}`, by: ev.data.by });
         return;
       case "claude":
-        this.claude(items, ev, ev.data as ClaudeMessage);
+      case "codex":
+        this.agentMessage(items, ev, ev.data);
+        return;
+      case "codex_limit":
+        items.push({ ...base, kind: "codex_limit", key: `lim-${ev.seq}`, resetsAt: ev.data.reset_at });
         return;
     }
   }
 
-  private claude(items: Item[], ev: G.SessionEvent, m: ClaudeMessage) {
+  private agentMessage(items: Item[], ev: G.SessionEvent, m: ClaudeMessage) {
     const base = { seq: ev.seq, ts: ev.ts };
     if (isInit(m)) {
       this.closeSetup(items, ev.ts);
@@ -443,6 +447,7 @@ export class TranscriptBuilder {
           kind: "init",
           key: `init-${ev.seq}`,
           model: m.model,
+          ...(ev.kind === "codex" ? { agent: "codex" as const } : {}),
           version: m.claude_code_version,
           cwd: typeof m.cwd === "string" ? m.cwd : undefined,
         });
@@ -520,7 +525,7 @@ export class TranscriptBuilder {
         ...base,
         kind: "turn",
         key: `t-${ev.seq}`,
-        durationMs: m.duration_ms,
+        durationMs: m.duration_ms ?? 0,
         ok: !m.is_error,
         text: m.result,
       });
@@ -713,7 +718,7 @@ export function settleLive(live: LiveTurn, events: G.SessionEvent[]): LiveTurn {
   if (!live.blocks.length && !live.tool) return live;
   let next = live;
   for (const ev of events) {
-    if (ev.kind !== "claude") continue;
+    if (ev.kind !== "claude" && ev.kind !== "codex") continue;
     const m = ev.data as ClaudeMessage;
     if (isAssistant(m) && !m.parent_tool_use_id) {
       next = { ...next, blocks: next.blocks.filter((b) => !b.done) };

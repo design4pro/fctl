@@ -24,7 +24,7 @@ import { AgentFloorIcon, PullRequestIcon, Spinner, StatusDot } from "@/component
 import { WorkspaceAvatar } from "@/components/workspace/avatar";
 import type * as G from "@/gen";
 import { cn } from "@/lib/cn";
-import { useInstance, useMe, useProjects, useSessions, useWorkspaces } from "@/lib/queries";
+import { useCodexSettings, useInstance, useMe, useProjects, useSessions, useWorkspaces } from "@/lib/queries";
 import { repoLabel } from "@/lib/repos";
 import { around, landing, marked, said, useSessionSearch } from "@/lib/search";
 import { SETTINGS_PAGES } from "@/lib/settings";
@@ -102,6 +102,7 @@ export function CommandPalette({
   const { data: sessions } = useSessions({ limit: 50 });
   const { data: workspaces } = useWorkspaces();
   const { data: instance } = useInstance();
+  const codexEnabled = useCodexSettings(!!me).data?.enabled === true;
   const found = useSessionSearch(q, { enabled: open });
 
   useEffect(() => {
@@ -259,6 +260,7 @@ export function CommandPalette({
     // they don't crowd.
     for (const p of SETTINGS_PAGES) {
       if (p.tab === "linear" && !instance?.features.linear) continue;
+      if (p.tab === "codex" && !codexEnabled) continue;
       list.push({
         id: `settings-${p.tab}`,
         group: "Settings",
@@ -285,6 +287,7 @@ export function CommandPalette({
     workspaces,
     me,
     instance,
+    codexEnabled,
     navigate,
     onClose,
     onNavigate,

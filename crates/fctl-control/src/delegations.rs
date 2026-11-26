@@ -719,8 +719,13 @@ async fn take_up(
     };
     let explore = explore_of(taker);
     let project = &taker.row;
-    let Some(credential) =
-        crate::api::sessions::credential_for(db, &user, project.workspace_id()).await?
+    let Some(credential) = crate::api::sessions::connection_for(
+        db,
+        &user,
+        project.workspace_id(),
+        fctl_proto::session::AgentKind::Claude,
+    )
+    .await?
     else {
         return refuse(format!(
             "{}, connect your Claude subscription in fctl first (Settings → Claude): sessions run on it. Then delegate {key} again.",

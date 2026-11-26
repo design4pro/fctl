@@ -3,6 +3,10 @@
 use crate::http::{Error, HttpClient, Result};
 use fctl_proto::api::*;
 use fctl_proto::autopilot::*;
+use fctl_proto::codex::{
+    CodexConnection, CodexLoginFinishRequest, CodexLoginStart, CodexLoginStartRequest,
+    CodexSelection, CodexSettings,
+};
 use fctl_proto::event::{Attachment, PublishedFile};
 use fctl_proto::hooks::*;
 use fctl_proto::service_accounts::*;
@@ -2065,6 +2069,47 @@ impl Api {
             },
         )
         .await
+    }
+
+    // ── Codex ──
+
+    pub async fn codex_settings(&self) -> Result<CodexSettings> {
+        self.get("/me/codex").await
+    }
+
+    pub async fn start_codex_login(&self, req: &CodexLoginStartRequest) -> Result<CodexLoginStart> {
+        self.post("/me/codex/login/start", req).await
+    }
+
+    pub async fn finish_codex_login(
+        &self,
+        req: &CodexLoginFinishRequest,
+    ) -> Result<CodexConnection> {
+        self.post("/me/codex/login/finish", req).await
+    }
+
+    pub async fn select_codex_connection(
+        &self,
+        workspace: Option<&str>,
+        req: &CodexSelection,
+    ) -> Result<()> {
+        let path = match workspace {
+            Some(id) => format!("/me/codex/workspaces/{}", enc(id)),
+            None => "/me/codex/default".into(),
+        };
+        self.put(&path, req).await
+    }
+
+    pub async fn retry_codex_connection(&self, id: &str) -> Result<()> {
+        self.post(
+            &format!("/me/codex/{}/retry", enc(id)),
+            &serde_json::json!({}),
+        )
+        .await
+    }
+
+    pub async fn disconnect_codex(&self, id: &str) -> Result<()> {
+        self.delete(&format!("/me/codex/{}", enc(id))).await
     }
 
     // ── admin ──

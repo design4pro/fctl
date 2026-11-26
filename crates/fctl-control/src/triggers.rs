@@ -579,6 +579,12 @@ async fn decide(
         }
     };
     let zone = schedules::zone(&row.timezone);
+    if schedules::codex_recheck_at(db, &owner.credential, now)
+        .await?
+        .is_some()
+    {
+        return skip("The owner's ChatGPT connection is at its usage limit.".into());
+    }
     let limits = schedules::usage_of(db, &owner.credential.id).await?;
     if let Some(limit) = sch::at_limit(&limits, now) {
         return skip(format!(

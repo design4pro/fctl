@@ -12,8 +12,8 @@ pub fn export_typescript(dir: &Path) -> Result<(), ExportError> {
         };
     }
     use crate::{
-        agent, api, autopilot, event, hooks, identity, runner, service_accounts, session, tickets,
-        uplink, viewer,
+        agent, api, autopilot, codex, event, hooks, identity, runner, service_accounts, session,
+        tickets, uplink, viewer,
     };
     export!(
         crate::ApiError,
@@ -35,6 +35,11 @@ pub fn export_typescript(dir: &Path) -> Result<(), ExportError> {
         autopilot::AutopilotFiles,
         autopilot::PutAutopilotFileRequest,
         crate::ErrorCode,
+        codex::CodexSettings,
+        codex::CodexLoginStartRequest,
+        codex::CodexLoginStart,
+        codex::CodexLoginFinishRequest,
+        codex::CodexSelection,
         event::SessionEvent,
         event::EventBody,
         event::KeptImage,
