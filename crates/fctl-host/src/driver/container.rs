@@ -916,6 +916,8 @@ impl ContainerDriver {
                 "1",
                 "--memory",
                 "512M",
+                // A separate init lets fctl-agent run its reach subcommand as a child.
+                "--init",
                 "--mount",
                 &mount,
                 "--entrypoint",
@@ -5096,6 +5098,10 @@ esac
         );
         let calls = apple.calls()?;
         assert_eq!(count(&calls, "run --rm --name fctl-reach-"), 1);
+        assert!(calls.iter().any(|call| {
+            call.starts_with("run --rm --name fctl-reach-")
+                && call.split_whitespace().any(|arg| arg == "--init")
+        }));
         assert_eq!(count(&calls, "system stop"), 0);
         // While it runs, the host's looks leave it out, rather than start a
         // fresh sandbox each time.
