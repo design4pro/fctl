@@ -1,10 +1,11 @@
-//! Codex App Server's stdio RPC, pinned to the protocol shipped in 0.172.0.
+//! Codex App Server's stdio RPC.
 
 mod events;
 pub mod responses;
 
 use anyhow::{Context, Result, ensure};
 pub use events::Update;
+use fctl_domain::updates::Version;
 use fctl_proto::runner::CodexCredential;
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
@@ -17,9 +18,34 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::Child;
 use tokio::sync::{mpsc, oneshot};
 
-pub const VERSION: &str = "0.172.0";
+const MIN_VERSION: Version = Version {
+    major: 0,
+    minor: 172,
+    patch: 0,
+};
 const PROVIDER: &str = "fctl_chatgpt";
 const RPC_TIMEOUT: Duration = Duration::from_secs(30);
+
+fn check_version(user_agent: &str) -> Result<()> {
+    let version = user_agent
+        .split_whitespace()
+        .next()
+        .and_then(|token| token.strip_prefix("fctl/"))
+        .context("Codex App Server did not report a version")?;
+    let version = version
+        .split_once('+')
+        .map_or(version, |(version, _)| version);
+    let (release, prerelease) = version
+        .split_once('-')
+        .map_or((version, false), |(release, _)| (release, true));
+    let release =
+        Version::parse(release).context("Codex App Server reported an invalid version")?;
+    ensure!(
+        release > MIN_VERSION || (release == MIN_VERSION && !prerelease),
+        "Codex App Server {MIN_VERSION} or later is required"
+    );
+    Ok(())
+}
 
 pub enum Output {
     Notification(Value),
@@ -251,11 +277,7 @@ impl Codex {
             .get("userAgent")
             .and_then(Value::as_str)
             .unwrap_or_default();
-        let expected = format!("fctl/{VERSION}");
-        ensure!(
-            version.split_whitespace().next() == Some(expected.as_str()),
-            "Codex App Server {VERSION} is required"
-        );
+        check_version(version)?;
         self.write(json!({"method": "initialized"}))?;
         let mut params = json!({
             "cwd": thread.cwd,
@@ -593,7 +615,7 @@ while IFS= read -r msg; do
     id=$(printf '%s' "$msg" | sed -n 's/.*"id":\([0-9]*\).*/\1/p')
     case "$msg" in
         *'"method":"initialize"'*)
-            printf '{"id":%s,"result":{"userAgent":"fctl/0.172.0 (fixture)"}}\n' "$id"
+            printf '{"id":%s,"result":{"userAgent":"fctl/0.173.0-alpha.5 (fixture)"}}\n' "$id"
             ;;
         *'"method":"initialized"'*) state=ready ;;
         *'"method":"thread/start"'*|*'"method":"thread/resume"'*)
@@ -636,6 +658,30 @@ done
             .write_all(FAKE.as_bytes())?;
         ensure!(child.wait()?.success(), "writing test app server");
         Ok(bin)
+    }
+
+    #[test]
+    fn checks_the_minimum_app_server_version() -> Result<()> {
+        for agent in [
+            "fctl/0.172.0 (fixture)",
+            "fctl/0.172.0+build.1 (fixture)",
+            "fctl/0.172.1 (fixture)",
+            "fctl/0.173.0-alpha.5 (fixture)",
+        ] {
+            check_version(agent)?;
+        }
+        for agent in ["fctl/0.171.99 (fixture)", "fctl/0.172.0-alpha.1 (fixture)"] {
+            let Err(error) = check_version(agent) else {
+                anyhow::bail!("Accepted unsupported version {agent}");
+            };
+            assert_eq!(
+                error.to_string(),
+                "Codex App Server 0.172.0 or later is required"
+            );
+        }
+        assert!(check_version("").is_err());
+        assert!(check_version("fctl/invalid (fixture)").is_err());
+        Ok(())
     }
 
     #[tokio::test]
