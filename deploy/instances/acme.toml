@@ -1,0 +1,64 @@
+# A template for your own instance. Copy it to deploy/instances/<name>.toml,
+# then run:
+#
+#   cargo xtask deploy <name> --create   # creates the D1 database, deploys
+#   cargo xtask secrets <name>           # master key, setup link, GitHub key
+#
+# See docs/self-hosting.md for the whole walkthrough.
+
+# The Worker's name in your Cloudflare account.
+worker = "fctl"
+# Shown in the app's title bar and in emails.
+instance_name = "fctl"
+# The app's origin. Its host becomes the Worker's custom domain, so its zone
+# must be on your Cloudflare account.
+public_url = "https://fctl.design4.pro"
+# Optional: let search engines index the sign-in page (/robots.txt lets them,
+# /sitemap.xml lists it). Without it, /robots.txt disallows everything
+# but /llms.txt.
+# search_engines = true
+# Optional: redirect plain HTTP to HTTPS, for every page, asset and API call.
+# The Worker then runs for every request, the app's files included, and
+# Cloudflare counts each as a Worker request. Without it, plain HTTP works too.
+# https_only = true
+# Optional: let instance admins make admin tokens, with which your own
+# programs create people's accounts and add them to workspaces and projects
+# (docs/self-hosting.md#provision-people-with-admin-tokens).
+# admin_tokens = true
+
+[d1]
+database_name = "fctl"
+# Filled in by `cargo xtask deploy <name> --create`.
+database_id = "317c42ef-abab-4786-b59c-29a26d9442c1"
+# Optional: where D1 keeps the primary copy (weur, eeur, wnam, enam, apac, oc).
+location = "weur"
+
+# Optional: link repositories through your own GitHub App (docs/github-app.md).
+[github]
+app_id = "5935736"
+app_slug = "fctl-design4pro"
+client_id = "Iv23liHQp1HlsMC2aevs"
+default_owner = "design4pro"
+#
+# Optional: a second GitHub App that review agents post their reviews as,
+# where it's installed (docs/self-hosting.md#a-review-app-optional). Set
+# its key with `cargo xtask secrets <name> --github-review-key key.pem`.
+[github.review]
+app_id = "5935841"
+app_slug = "fctl-design4pro-review"
+
+# Optional: delegate Linear issues to fctl, through your own Linear OAuth app
+# (docs/self-hosting.md#connect-linear-optional). Set LINEAR_CLIENT_SECRET and
+# LINEAR_WEBHOOK_SECRET with `cargo xtask secrets <name> --set …`.
+# [linear]
+# client_id = "..."
+
+# Optional: send invites and password resets by email through Resend
+# (set RESEND_API_KEY with `cargo xtask secrets <name>`). Without it, admins
+# copy invite and reset links from the app.
+# [email]
+# from = "fctl <noreply@example.com>"
+
+# Optional: "Sign in with Google" (set GOOGLE_CLIENT_SECRET as a secret).
+# [google]
+# client_id = "1234-abc.apps.googleusercontent.com"
