@@ -36,6 +36,7 @@ import { type ReactNode, useEffect, useRef, useState } from "react";
 import { CONNECT_ID, ConnectClaude, EndedLogin, EndedToken, type Way } from "@/components/claude/connect";
 import { OnRunnersDetails } from "@/components/claude/on-runners";
 import { KeepTokenOut } from "@/components/claude/stand-in";
+import { CodexSettings } from "@/components/codex/settings";
 import { PasskeySettings } from "@/components/passkeys/settings";
 import { PlanUsageList } from "@/components/plan-usage";
 import { AppLog } from "@/components/settings/app-log";
@@ -82,7 +83,15 @@ import { gravatarNews, gravatarPicture } from "@/lib/gravatar";
 import { goTo } from "@/lib/history";
 import { sampleTime, useHourCycle } from "@/lib/hour-cycle";
 import { disablePush, enablePush, forgetPush, permission, pushSupport } from "@/lib/push";
-import { fetchMe, keys, queryClient, useInstance, useMe, useWorkspaces } from "@/lib/queries";
+import {
+  fetchMe,
+  keys,
+  queryClient,
+  useCodexSettings,
+  useInstance,
+  useMe,
+  useWorkspaces,
+} from "@/lib/queries";
 import { forgetLeft } from "@/lib/reopen";
 import {
   askedTab,
@@ -120,11 +129,15 @@ export function SettingsPage() {
   const search = useSearch({ from: "/app/settings" });
   const hash = useLocation({ select: (l) => l.hash });
   const { data: instance } = useInstance();
+  const { data: codex, isPending: checkingCodex } = useCodexSettings(!!me);
   if (!me) return null;
-  // Linear's page, where the instance has a Linear app.
-  const has = (t: SettingsTab) => t !== "linear" || !!instance?.features.linear;
+  const has = (t: SettingsTab) => {
+    if (t === "linear") return !!instance?.features.linear;
+    if (t === "codex") return codex?.enabled === true;
+    return true;
+  };
   const asked = askedTab(search, hash);
-  const tab = asked && has(asked) ? asked : undefined;
+  const tab = asked && (has(asked) || (asked === "codex" && checkingCodex)) ? asked : undefined;
   return (
     // Its own width (a container query) decides how it shows: the list of pages beside the page
     // open, Profile until one is chosen, where both fit; else the list, or the page it opened
@@ -183,6 +196,8 @@ function SettingsBody({
       return <Workspaces me={me} />;
     case "claude":
       return <Claude me={me} />;
+    case "codex":
+      return <CodexSettings />;
     case "linear":
       return <LinearAccounts returned={search.linear} />;
     case "notifications":
@@ -299,6 +314,7 @@ function PageList({
 function useGists(me: G.Me, has: (t: SettingsTab) => boolean): Partial<Record<SettingsTab, Gist>> {
   const workspaces = useWorkspaces().data?.workspaces;
   const linear = useQuery({ queryKey: keys.myLinear, queryFn: api.myLinear, enabled: has("linear") });
+  const codex = useCodexSettings(has("codex")).data;
   const tokens = useQuery({ queryKey: keys.tokens, queryFn: api.tokens });
   const notifications = useQuery({ queryKey: keys.notifications, queryFn: api.notifications });
   const [theme] = useTheme();
@@ -308,6 +324,11 @@ function useGists(me: G.Me, has: (t: SettingsTab) => boolean): Partial<Record<Se
     emails: emailsGist(me),
     workspaces: workspacesGist(workspaces),
     claude: claudeGist(me.claude),
+    codex: codex && {
+      text: codex.connections.some((c) => c.connected && c.plan_enabled)
+        ? "ChatGPT plan connected"
+        : "Connect your ChatGPT plan",
+    },
     linear: linearGist(linear.data?.accounts),
     notifications: notifications.data && {
       text: here ? "On in this browser" : "Off in this browser",

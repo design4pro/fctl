@@ -425,7 +425,12 @@ impl HttpClient {
                 body: String::from_utf8_lossy(&bytes).chars().take(500).collect(),
             });
         }
-        serde_json::from_slice(&bytes).map_err(|e| Error::Decode(e.to_string()))
+        let json = if status == http::StatusCode::NO_CONTENT {
+            b"null"
+        } else {
+            &bytes[..]
+        };
+        serde_json::from_slice(json).map_err(|e| Error::Decode(e.to_string()))
     }
 
     /// Downloads `url` into memory (follows up to 5 redirects).

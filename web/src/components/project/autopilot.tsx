@@ -58,6 +58,7 @@ import {
   Button,
   CopyButton,
   Dialog,
+  Field,
   IconButton,
   Input,
   Menu,
@@ -101,8 +102,16 @@ import { connectionIn } from "@/lib/claude";
 import { cn } from "@/lib/cn";
 import { MAX_TOKENS, MIN_TOKENS, parseTokens, tokensText, validWindow } from "@/lib/context";
 import { ago, agoShort, agoShortWords, bytes, clock, day, num, stamp } from "@/lib/format";
-import { EFFORTS, effortLabel, modelLabel, modelOffers } from "@/lib/models";
-import { keys, queryClient, useMe, useProjects, useWorkspace } from "@/lib/queries";
+import {
+  AGENTS,
+  effortLabel,
+  effortLevels,
+  modelLabel,
+  modelOffers,
+  planName,
+  projectChoice,
+} from "@/lib/models";
+import { keys, queryClient, useCodexSettings, useMe, useProjects, useWorkspace } from "@/lib/queries";
 import { planOf } from "@/lib/usage";
 
 // ───────────────────────────── the tab ─────────────────────────────
@@ -352,8 +361,9 @@ function Intro({
           </h2>
           <p className="mt-3 max-w-xl text-[15px] leading-relaxed text-ink-3">
             Give {project.name} a direction, and an agent takes it from there: it plans the work, starts
-            sessions to do it, and sets up what they need. It acts as you, on your Claude subscription, and
-            asks you when only a person can decide.
+            sessions to do it, and sets up what they need. It acts as you, on your{" "}
+            {planName(before ? before.agent_kind : project.settings.agent_kind)}, and asks you when only a
+            person can decide.
           </p>
           <ul className="mt-6 flex max-w-xl flex-col gap-3">
             {POINTS.map((p) => (
@@ -395,7 +405,7 @@ function Intro({
         </Banner>
       ) : !can ? (
         <p className="text-[13px] text-ink-4">
-          The project's maintainers and owners put it on autopilot, on their own Claude subscription.
+          The project's maintainers and owners put it on autopilot, on their own subscription.
         </p>
       ) : (
         <section aria-labelledby="directions-heading">
@@ -543,6 +553,9 @@ function Engage({
   const [powers, setPowers] = useState<G.AutopilotPower[]>(before?.powers ?? defaultPowers("project"));
   const [checkIn, setCheckIn] = useState(before?.check_in_minutes ?? DEFAULT_CHECK_IN);
   const [crew, setCrew] = useState(before?.crew_max ?? DEFAULT_CREW);
+  const [agent, setAgent] = useState<G.AgentKind>(
+    before ? (before.agent_kind ?? "claude") : (project.settings.agent_kind ?? "claude"),
+  );
   const [model, setModel] = useState(before?.model ?? "");
   const [effort, setEffort] = useState(before?.effort ?? "");
   const text = useRef<HTMLTextAreaElement>(null);
@@ -569,7 +582,8 @@ function Engage({
         powers,
         check_in_minutes: checkIn,
         crew_max: crew,
-        model: model || "default",
+        ...(agent !== (before?.agent_kind ?? "claude") && { agent_kind: agent }),
+        model: model.trim() || "default",
         effort: effort || "default",
       }),
     onSuccess: (a) => {
@@ -708,6 +722,8 @@ function Engage({
         </div>
         <ModelFields
           project={project}
+          agent={agent}
+          setAgent={setAgent}
           model={model}
           setModel={setModel}
           effort={effort}
@@ -716,7 +732,7 @@ function Engage({
       </div>
       <div className="flex flex-wrap items-center justify-end gap-x-4 gap-y-3 border-t border-line px-5 py-3.5">
         <p className="mr-auto max-w-md text-[12.5px] leading-snug text-ink-3">
-          It runs on your Claude subscription and acts as you
+          It runs on your {planName(agent)} and acts as you
           {scope === "workspace" ? " in every project" : ""}: its own sessions and those it starts.
         </p>
         <Button type="button" variant="ghost" onClick={onCancel}>
@@ -837,34 +853,65 @@ function RhythmFields({
 
 function ModelFields({
   project,
+  agent,
+  setAgent,
   model,
   setModel,
   effort,
   setEffort,
 }: {
   project: G.Project;
+  agent: G.AgentKind;
+  setAgent: (a: G.AgentKind) => void;
   model: string;
   setModel: (m: string) => void;
   effort: string;
   setEffort: (e: string) => void;
 }) {
-  const own = project.settings.model ?? "";
+  const codexEnabled = useCodexSettings().data?.enabled === true;
+  const own = projectChoice(project, agent);
   const models: SelectOption[] = [
-    { value: "", label: `The project's (${modelLabel(own)})` },
-    ...modelOffers(project, model)
+    { value: "", label: `The project's (${modelLabel(own.model, agent)})` },
+    ...modelOffers(project, model, agent)
       .filter((o) => o.value)
       .map((o) => ({ value: o.value, label: o.label })),
   ];
-  const ownEffort = project.settings.effort ?? "";
   const efforts: SelectOption[] = [
-    { value: "", label: `The project's (${effortLabel(ownEffort)})` },
-    ...EFFORTS.map((e) => ({ value: e.value, label: e.label })),
+    { value: "", label: `The project's (${effortLabel(own.effort, agent)})` },
+    ...effortLevels(agent),
   ];
   return (
     <div>
+      {(codexEnabled || agent === "codex") && (
+        <div className="mb-3">
+          <Field label="Autopilot agent">
+            {(id) => (
+              <Select
+                id={id}
+                value={agent}
+                options={AGENTS.map((a) => ({ ...a, disabled: a.value === "codex" && !codexEnabled }))}
+                onChange={(next) => {
+                  setAgent(next);
+                  setModel("");
+                  setEffort("");
+                }}
+              />
+            )}
+          </Field>
+        </div>
+      )}
       <span className="mb-1.5 block text-[12.5px] font-medium text-ink-2">Its own sessions think with</span>
       <div className="grid gap-2 sm:grid-cols-2">
-        <Select aria-label="Its model" value={model} options={models} onChange={setModel} />
+        {agent === "codex" ? (
+          <Input
+            aria-label="Its model ID"
+            placeholder={modelLabel(own.model, agent)}
+            value={model}
+            onChange={(e) => setModel(e.target.value)}
+          />
+        ) : (
+          <Select aria-label="Its model" value={model} options={models} onChange={setModel} />
+        )}
         <Select aria-label="Its effort level" value={effort} options={efforts} onChange={setEffort} />
       </div>
       <p className="mt-1.5 text-[12.5px] text-ink-4">
@@ -1014,7 +1061,7 @@ function Header({ project, a }: { project: G.Project; a: G.Autopilot }) {
           </p>
           <p className="mt-2 text-[12.5px] text-ink-4">
             {a.owner
-              ? `On ${a.owner.id === me?.user.id ? "your" : `${a.owner.name}'s`} Claude subscription`
+              ? `On ${a.owner.id === me?.user.id ? "your" : `${a.owner.name}'s`} ${planName(a.agent_kind)}`
               : "Its owner is gone"}
             {" · "}
             {a.check_ins === 1 ? "1 check-in" : `${a.check_ins} check-ins`}
@@ -1193,8 +1240,8 @@ export function MoveButtons({ a }: { a: G.Autopilot }) {
         mine
           ? "It wakes at once"
           : a.keep_owner && a.owner
-            ? `It wakes at once, on ${a.owner.name}'s Claude subscription, which they keep it on`
-            : "It wakes at once, on your Claude subscription from now on"
+            ? `It wakes at once, on ${a.owner.name}'s ${planName(a.agent_kind)}, which they keep it on`
+            : `It wakes at once, on your ${planName(a.agent_kind)} from now on`
       }
     >
       Resume
@@ -1302,7 +1349,7 @@ function TakeOverDialog({
       open={open}
       onClose={onClose}
       title="Run it on your subscription?"
-      description={`From now on it runs on your Claude subscription and acts as you${where}: its own sessions and those it starts.${a.owner ? ` ${a.owner.name} no longer runs it${a.keep_owner ? ", and whether it stays on yours when others change it is then yours to choose" : ""}.` : ""}`}
+      description={`From now on it runs on your ${planName(a.agent_kind)} and acts as you${where}: its own sessions and those it starts.${a.owner ? ` ${a.owner.name} no longer runs it${a.keep_owner ? ", and whether it stays on yours when others change it is then yours to choose" : ""}.` : ""}`}
     >
       <div className="mt-6 flex justify-end gap-2">
         <Button variant="ghost" onClick={onClose}>
@@ -1331,6 +1378,7 @@ function SettingsDialog({
   const [powers, setPowers] = useState(a.powers);
   const [checkIn, setCheckIn] = useState(a.check_in_minutes);
   const [crew, setCrew] = useState(a.crew_max);
+  const [agent, setAgent] = useState<G.AgentKind>(a.agent_kind ?? "claude");
   const [model, setModel] = useState(a.model ?? "");
   const [effort, setEffort] = useState(a.effort ?? "");
   const [handoff, setHandoff] = useState(handoffChoice(a.handoff_at));
@@ -1347,6 +1395,7 @@ function SettingsDialog({
     setPowers(a.powers);
     setCheckIn(a.check_in_minutes);
     setCrew(a.crew_max);
+    setAgent(a.agent_kind ?? "claude");
     setModel(a.model ?? "");
     setEffort(a.effort ?? "");
     setHandoff(handoffChoice(a.handoff_at));
@@ -1367,6 +1416,7 @@ function SettingsDialog({
   const costs =
     checkIn !== a.check_in_minutes ||
     crew !== a.crew_max ||
+    agent !== (a.agent_kind ?? "claude") ||
     model !== (a.model ?? "") ||
     effort !== (a.effort ?? "") ||
     (handoffAt !== undefined && handoffAt !== (a.handoff_at ?? null));
@@ -1382,7 +1432,8 @@ function SettingsDialog({
         powers,
         check_in_minutes: checkIn,
         crew_max: crew,
-        model: model || "default",
+        ...(agent !== (a.agent_kind ?? "claude") && { agent_kind: agent }),
+        model: model.trim() || "default",
         effort: effort || "default",
         // 0: only after 12 hours.
         handoff_at: handoffAt ?? 0,
@@ -1407,6 +1458,8 @@ function SettingsDialog({
         </div>
         <ModelFields
           project={project}
+          agent={agent}
+          setAgent={setAgent}
           model={model}
           setModel={setModel}
           effort={effort}
@@ -1423,8 +1476,8 @@ function SettingsDialog({
         {!mine && costs && a.owner && (
           <Banner tone="info">
             {a.keep_owner
-              ? `It runs on ${a.owner.name}'s Claude subscription, which they keep it on when others change it: your changes run on theirs.`
-              : `It runs on ${a.owner.name}'s Claude subscription. Changing how much it works runs it on yours from now on.`}
+              ? `It runs on ${a.owner.name}'s ${planName(a.agent_kind)}, which they keep it on when others change it: your changes run on theirs.`
+              : `It runs on ${a.owner.name}'s ${planName(a.agent_kind)}. Changing how much it works runs it on yours from now on.`}
           </Banner>
         )}
       </div>
@@ -2424,6 +2477,7 @@ export function CrewRow({ c, home }: { c: G.AutopilotCrew; home?: string }) {
 }
 
 function Rules({ a, project }: { a: G.Autopilot; project: G.Project }) {
+  const own = projectChoice(project, a.agent_kind ?? "claude");
   return (
     <Card title="How it works" icon={<Settings2 />}>
       <ul className="flex flex-col gap-1.5 text-[12.5px] leading-snug text-ink-3">
@@ -2452,9 +2506,9 @@ function Rules({ a, project }: { a: G.Autopilot; project: G.Project }) {
         {a.keep_owner && <KeptLine a={a} />}
         <li className="flex gap-2">
           <Sparkles className="mt-[2px] size-3.5 shrink-0 text-ink-4" aria-hidden="true" />
-          Thinks with {modelLabel(a.model ?? project.settings.model ?? "")}
-          {(a.effort ?? project.settings.effort)
-            ? ` at ${effortLabel(a.effort ?? project.settings.effort ?? "").toLowerCase()} effort`
+          Thinks with {modelLabel(a.model ?? own.model, a.agent_kind)}
+          {(a.effort ?? own.effort)
+            ? ` at ${effortLabel(a.effort ?? own.effort, a.agent_kind).toLowerCase()} effort`
             : ""}
         </li>
         <li className="flex gap-2">

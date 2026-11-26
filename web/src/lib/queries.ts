@@ -104,6 +104,7 @@ export const keys = {
   projectTickets: (project: string) => ["project-tickets", project] as const,
   /** Your Linear accounts. */
   myLinear: ["me", "linear"] as const,
+  codex: ["me", "codex"] as const,
   runners: ["runners"] as const,
   users: ["users"] as const,
   allowlist: ["allowlist"] as const,
@@ -166,6 +167,9 @@ export async function fetchMe(within?: number): Promise<G.Me | null> {
 }
 
 export const useMe = () => useQuery({ queryKey: keys.me, queryFn: () => fetchMe(), staleTime: 60_000 });
+
+export const useCodexSettings = (enabled = true) =>
+  useQuery({ queryKey: keys.codex, queryFn: api.codexSettings, enabled });
 
 /** Your projects, in your order: under your workspaces in theirs. */
 export const useProjects = () =>

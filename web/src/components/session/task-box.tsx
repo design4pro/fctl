@@ -14,6 +14,7 @@ import {
 import {
   StartButton,
   StartChoices,
+  StartPlan,
   useKeepDraft,
   useStartChoice,
   useStartSession,
@@ -196,9 +197,13 @@ export function TaskBox({
           )}
           aria-label="Task for a new session"
         />
+        <StartPlan choice={choice} workspace={target?.workspace?.id} />
         {/* On a phone it keeps one line: where the controls run out of room, the project's name and
             the model's give way, and their starts show. */}
-        <TextareaControls textarea={ref} className="flex-wrap gap-2 pt-4 pr-3 pb-3 pl-2.5 max-sm:flex-nowrap">
+        <TextareaControls
+          textarea={ref}
+          className="flex-wrap gap-2 pt-4 pr-3 pb-3 pl-2.5 max-sm:not-has-[[data-agent-picker]]:flex-nowrap"
+        >
           <AttachButton onFiles={(f) => attach(f)} disabled={starting} />
           {/* It takes the room left on its line, which puts what follows at the end. On a phone it
               keeps room for the start of the project's name, and gives up some of it with the model's

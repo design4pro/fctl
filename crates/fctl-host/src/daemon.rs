@@ -1498,6 +1498,7 @@ impl Daemon {
                 fctl_proto::runner::FEATURE_TRIAGE.to_owned(),
                 fctl_proto::runner::FEATURE_DRIVERS.to_owned(),
                 fctl_proto::runner::FEATURE_SNAPSHOTS.to_owned(),
+                fctl_proto::runner::FEATURE_CODEX.to_owned(),
             ],
             claude_token: Some(claude_token::announce(&self.ctx.cfg.claude_token())),
             auto_update: Some(self.updates.is_some()),
@@ -1828,6 +1829,7 @@ impl Daemon {
             FleetToHost::Credential {
                 request_id,
                 mut claude,
+                codex,
                 github,
                 github_read,
                 mut error,
@@ -1847,6 +1849,7 @@ impl Daemon {
                     let _ = h.tx.send(SessionCmd::Credentials {
                         request_id: Some(agent_request),
                         claude,
+                        codex,
                         github,
                         github_read,
                         error,
@@ -1894,11 +1897,21 @@ impl Daemon {
     fn start_session(&mut self, mut spec: Box<SessionSpec>) -> Result<(), String> {
         let id = spec.session_id.clone();
         // Its person keeps their Claude token on their runners: this one's.
-        claude_token::fill(
-            &self.ctx.cfg.claude_token(),
-            &mut spec.credentials.claude,
-            &self.ctx.cfg.name,
-        )?;
+        use fctl_proto::session::AgentKind;
+        match spec.agent_kind.unwrap_or_default() {
+            AgentKind::Claude => {
+                let credential = spec
+                    .credentials
+                    .claude
+                    .as_mut()
+                    .ok_or_else(|| "The session has no Claude connection".to_owned())?;
+                claude_token::fill(&self.ctx.cfg.claude_token(), credential, &self.ctx.cfg.name)?;
+            }
+            AgentKind::Codex if spec.credentials.codex.is_none() => {
+                return Err("The session has no ChatGPT connection".into());
+            }
+            AgentKind::Codex => {}
+        }
         // The control plane only sends sessions that fit; an older one may
         // not know this host's limits.
         let limits = self.ctx.sandbox_limits();
@@ -2899,9 +2912,12 @@ mod tests {
         assert_eq!(d.start_session(spec_on_runners("ses_01KEPT")?), Ok(()));
         assert_eq!(d.start_session(spec("ses_01ELSE")?), Ok(()));
         let token_of = |d: &Daemon, id: &str| {
-            d.pending_starts
-                .get(&SessionId(id.into()))
-                .map(|s| s.credentials.claude.access_token.clone())
+            d.pending_starts.get(&SessionId(id.into())).and_then(|s| {
+                s.credentials
+                    .claude
+                    .as_ref()
+                    .map(|c| c.access_token.clone())
+            })
         };
         assert_eq!(token_of(&d, "ses_01KEPT").as_deref(), Some(CLAUDE_TOKEN));
         // A session on a token the control plane keeps runs on that one.
@@ -2934,7 +2950,8 @@ mod tests {
                 .insert(request.into(), (sid.clone(), format!("agent-{request}")));
             d.on_fleet(FleetToHost::Credential {
                 request_id: request.into(),
-                claude: Some(placeholder.clone()),
+                claude: placeholder.clone(),
+                codex: None,
                 github: None,
                 github_read: None,
                 error: None,

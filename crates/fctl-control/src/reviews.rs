@@ -26,7 +26,7 @@ use crate::db::{int, int_bool, n, opt_int, os, q, s};
 use crate::error::{AppError, AppResult, conflict, forbidden, not_found};
 use crate::github::{self, Github};
 use crate::internal::{self, InitSession, Schedule, Stop};
-use crate::model::{CredentialRow, PROJECT_SELECT, ProjectRow, UserRow, user_columns};
+use crate::model::{PROJECT_SELECT, ProjectRow, UserRow, user_columns};
 use crate::workspaces::ConnectionRow;
 use fctl_domain::hooks::Kind as HookKind;
 use fctl_domain::reviews::{self as rv, Links, PullRequest};
@@ -54,6 +54,8 @@ pub struct SettingsRow {
     pub operator_avatar: Option<String>,
     pub model: Option<String>,
     pub effort: Option<String>,
+    #[serde(default)]
+    pub agent_kind: Option<fctl_proto::session::AgentKind>,
     pub instructions: Option<String>,
     /// The apps whose pull requests start reviews by themselves, as JSON.
     #[serde(default)]
@@ -129,7 +131,7 @@ pub async fn settings(db: &D1Database, project_id: &str) -> AppResult<Option<Set
     q(
         db,
         "SELECT r.enabled, r.operator_id, ou.name AS operator_name, ou.avatar_url AS operator_avatar, \
-         r.model, r.effort, r.instructions, r.bots, r.skipped_repos, r.drafts, r.description_summary, r.rounds, r.updated_by, \
+         r.model, r.effort, r.agent_kind, r.instructions, r.bots, r.skipped_repos, r.drafts, r.description_summary, r.rounds, r.updated_by, \
          uu.name AS updater_name, \
          uu.avatar_url AS updater_avatar, r.updated_at FROM project_reviews r \
          LEFT JOIN users ou ON ou.id = r.operator_id LEFT JOIN users uu ON uu.id = r.updated_by \
@@ -505,7 +507,7 @@ pub async fn list(
 /// What a review runs as: the operator and their Claude connection.
 pub struct Operator {
     pub user: UserRow,
-    pub credential: CredentialRow,
+    pub credential: crate::api::sessions::SessionConnection,
 }
 
 /// The person a project's reviews run for and their Claude connection, or
@@ -553,9 +555,16 @@ pub async fn operator(
             "They run on {name}'s Claude subscription, and {name} can no longer start sessions in this project. A project owner runs them on theirs."
         )));
     }
+    let agent = conf.agent_kind.unwrap_or_default();
     let credential =
-        crate::api::sessions::credential_for(db, &user, project.workspace_id()).await?;
+        crate::api::sessions::connection_for(db, &user, project.workspace_id(), agent).await?;
     let Some(credential) = credential else {
+        if agent == fctl_proto::session::AgentKind::Codex {
+            return Ok(Err(format!(
+                "{} needs to connect a ChatGPT plan to run reviews.",
+                user.name
+            )));
+        }
         return Ok(Err(format!(
             "They run on {name}'s Claude subscription, and {name} has no Claude connection. They connect one under Settings → Claude, or a project owner runs reviews on theirs."
         )));
@@ -998,6 +1007,13 @@ async fn put(
         Ok(op) => op,
         Err(why) => return Ok(Err(Started::Skipped(why))),
     };
+    if op.credential.agent == fctl_proto::session::AgentKind::Codex
+        && crate::codex::is_paused(db, &op.credential.id, now).await?
+    {
+        return Ok(Err(Started::Skipped(
+            "The operator's ChatGPT connection is at its usage limit.".into(),
+        )));
+    }
     let key = pr.repo.full_name().to_ascii_lowercase();
     #[derive(Deserialize)]
     struct Attempt {
@@ -1082,8 +1098,8 @@ async fn put(
         q(
             db,
             "INSERT INTO sessions (id, project_id, number, title, prompt, status, created_by, credential_id, branch, base_branch, \
-             model, effort, claude_session_id, stats, created_at, updated_at, last_activity_at, github_access, pull_requests) \
-             VALUES (?1, ?2, (SELECT session_counter FROM projects WHERE id = ?2), ?3, ?4, 'queued', ?5, ?6, ?7, ?8, ?9, ?10, ?11, '{}', ?12, ?12, ?12, 'read', ?13)",
+             model, effort, claude_session_id, stats, created_at, updated_at, last_activity_at, github_access, pull_requests, agent_kind) \
+             VALUES (?1, ?2, (SELECT session_counter FROM projects WHERE id = ?2), ?3, ?4, 'queued', ?5, ?6, ?7, ?8, ?9, ?10, ?11, '{}', ?12, ?12, ?12, 'read', ?13, ?14)",
             &[
                 s(id.as_str()),
                 s(&project.id),
@@ -1098,6 +1114,7 @@ async fn put(
                 s(&fctl_domain::ids::uuid_v4()),
                 n(now),
                 s(&pull_requests),
+                os(conf.agent_kind.map(fctl_proto::session::AgentKind::as_str)),
             ],
         )?,
         q(
@@ -3421,6 +3438,67 @@ mod tests {
         // A review fctl kept no record of: as many as by default.
         assert_eq!(rounds_of(&db, "ses_unknown").await?, rv::DEFAULT_ROUNDS);
         Ok(())
+    }
+
+    #[wasm_bindgen_test]
+    async fn codex_review_uses_the_operators_workspace_connection_and_limit() -> AppResult<()> {
+        use fctl_proto::session::AgentKind;
+
+        let db = testing::database();
+        let (project, ada) = project(&db).await?;
+        let pr = pull_request();
+        q(
+            &db,
+            "UPDATE project_reviews SET agent_kind = 'codex' WHERE project_id = ?",
+            &[s(&project.id)],
+        )?
+        .run()
+        .await?;
+        let no_connection = put(&db, NOW, &project, &pr, 1, Some(&ada), true).await?;
+        assert!(
+            matches!(no_connection, Err(Started::Skipped(why)) if why.contains("ChatGPT plan"))
+        );
+
+        let keys = crate::crypto::Keys::derive(&[42; 32]);
+        let link = crate::codex::dev_seed(&db, &keys, &ada.id, NOW).await?;
+        crate::codex::select(&db, &ada.id, None, None).await?;
+        crate::codex::select(
+            &db,
+            &ada.id,
+            Some(project.workspace_id()),
+            Some(link.id.as_str()),
+        )
+        .await?;
+        crate::codex::pause(&db, link.id.as_str(), None).await?;
+        let paused = put(&db, NOW, &project, &pr, 1, Some(&ada), true).await?;
+        assert!(
+            matches!(paused, Err(Started::Skipped(why)) if why.contains("ChatGPT connection is at its usage limit"))
+        );
+        assert_eq!(count(&db, "SELECT COUNT(*) AS n FROM sessions").await?, 0);
+
+        crate::codex::retry(&db, link.id.as_str()).await?;
+        let Ok(review) = put(&db, NOW + 1, &project, &pr, 1, Some(&ada), true).await? else {
+            return Err(internal("the Codex review was not queued"));
+        };
+        let session = crate::spec::session_row(&db, review.id.as_str())
+            .await?
+            .ok_or_else(|| internal("no review session"))?;
+        assert_eq!(session.agent_kind, Some(AgentKind::Codex));
+        assert_eq!(session.credential_id.as_deref(), Some(link.id.as_str()));
+        assert_eq!(session.created_by, ada.id);
+        crate::codex::pause(&db, link.id.as_str(), None).await?;
+        let usage = crate::spec::codex_usage_for_session(&db, review.id.as_str(), NOW).await?;
+        assert_eq!(
+            usage.map(|usage| usage.frame()),
+            Some(fctl_proto::uplink::UplinkDown::PauseCodex { reset_at: None }),
+        );
+        crate::codex::retry(&db, link.id.as_str()).await?;
+        let usage = crate::spec::codex_usage_for_session(&db, review.id.as_str(), NOW).await?;
+        assert_eq!(
+            usage.map(|usage| usage.frame()),
+            Some(fctl_proto::uplink::UplinkDown::ResumeCodex),
+        );
+        one_review(&db).await
     }
 }
 

@@ -8,6 +8,14 @@ import type * as G from "@/gen";
 /** Statuses a session can be taken over in: it waits or rests, rather than works. */
 const MOVES = new Set<G.SessionStatus>(["paused", "idle", "stopping", "stopped"]);
 
+export function chosenCodexConnection(settings: G.CodexSettings | undefined, workspace?: string) {
+  if (!settings?.enabled) return undefined;
+  const id =
+    settings.workspace_connections.find((c) => c.workspace_id === workspace)?.connection_id ??
+    settings.default_connection_id;
+  return settings.connections.find((c) => c.id === id);
+}
+
 export interface TakeOver {
   /** Whose subscription it runs on, when not yours. */
   whose?: string;
@@ -28,10 +36,16 @@ export function takeOverOf(
   session: G.Session | undefined,
   role: G.SessionRole | undefined,
   me: Pick<G.Me, "user" | "claude"> | null | undefined,
-  connections: { mine?: string; chosen?: string } = {},
+  connections: { mine?: string; chosen?: string; codexActive?: boolean } = {},
 ): TakeOver | undefined {
   if (!session || !me || (role !== "editor" && role !== "owner")) return undefined;
   if (session.review || session.autopilot?.role === "pilot" || !MOVES.has(session.status)) return undefined;
+  if (session.agent_kind === "codex") {
+    const account = session.codex ?? session.created_by;
+    return connections.codexActive && account.id !== me.user.id
+      ? { whose: account.name, waits: session.status === "paused" }
+      : undefined;
+  }
   const active = me.claude.filter((c) => c.status === "active");
   if (!active.length) return undefined;
   const runsOn = session.claude ?? session.created_by;

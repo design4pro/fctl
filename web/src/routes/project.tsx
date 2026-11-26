@@ -34,6 +34,7 @@ import { SessionRow } from "@/components/session/row";
 import {
   StartButton,
   StartChoices,
+  StartPlan,
   useKeepDraft,
   useStartChoice,
   useStartSession,
@@ -479,6 +480,7 @@ function StartForm({ project, user }: { project: G.Project; user: string }) {
           className="block px-5 pt-4 font-display text-[17px] leading-[1.5] placeholder:text-ink-4"
           aria-label="Task for a new session"
         />
+        <StartPlan choice={choice} workspace={project.workspace?.id} />
         {/* More room above the pickers where they take a line of their own. On a phone everything
             keeps one line, down to 360 px with a model named by its ID and the GitHub picker: the
             gaps are narrower there, and the pickers go to the end without the spacer and its

@@ -1,6 +1,7 @@
 //! `fctl run`, `sessions`, `show`, `edit`, `logs`, `diff`, `send`, `interrupt`, `stop`,
 //! `resume`, `follow`, `unfollow`, `share`, `unshare`, `archive`, `unarchive`, `open`.
 
+use super::codex::{AgentArg, require_supported, subscription};
 use crate::config;
 use crate::render::Renderer;
 use crate::style;
@@ -17,7 +18,7 @@ use fctl_proto::api::{
 use fctl_proto::autopilot::AutopilotRole;
 use fctl_proto::event::{EventBody, SessionEvent};
 use fctl_proto::session::{
-    GithubAccess, PullRequestRef, Session, SessionRole, SessionStats, SessionStatus,
+    AgentKind, GithubAccess, PullRequestRef, Session, SessionRole, SessionStats, SessionStatus,
 };
 use fctl_proto::{AttachmentId, SessionId};
 use std::io::{IsTerminal, Read};
@@ -46,10 +47,13 @@ pub struct RunArgs {
     /// session fails when the repository has commits but not this branch.
     #[arg(long)]
     pub base: Option<String>,
-    /// Claude model (opus, sonnet, haiku, fable, or a full model name).
+    /// Coding agent; defaults to the project's.
+    #[arg(long, value_enum)]
+    pub agent: Option<AgentArg>,
+    /// Model alias or ID supported by the selected agent.
     #[arg(long)]
     pub model: Option<String>,
-    /// Effort: low, medium, high, xhigh or max.
+    /// Effort level supported by the selected agent.
     #[arg(long)]
     pub effort: Option<String>,
     /// What its agent may do on GitHub: push, comment (review, comment and
@@ -306,6 +310,8 @@ async fn upload_seen(
 pub async fn start(server: Option<&str>, args: RunArgs, json: bool) -> Result<()> {
     let api = config::api(server)?;
     let project = project_or_default(args.project)?;
+    let agent_kind = args.agent.map(Into::into);
+    require_supported(&api, agent_kind).await?;
     let prompt = if let Some(f) = &args.file {
         std::fs::read_to_string(f).with_context(|| format!("reading {}", f.display()))?
     } else if !args.prompt.is_empty() {
@@ -330,12 +336,22 @@ pub async fn start(server: Option<&str>, args: RunArgs, json: bool) -> Result<()
                 branch: args.branch,
                 model: args.model,
                 effort: args.effort,
+                agent_kind,
                 attachments,
                 github_access: args.github.map(Into::into),
                 github_issues: args.github_issues.then_some(true),
             },
         )
         .await?;
+    if agent_kind == Some(AgentKind::Codex) && session.agent_kind != agent_kind {
+        let _ = api.stop(session.id.as_str()).await;
+        bail!(
+            "{} did not start a Codex session, so fctl stopped {}#{}.",
+            api.base(),
+            session.project_slug,
+            session.number
+        );
+    }
     // A control plane from before GitHub access ignores it, and its agent
     // would push.
     if args
@@ -644,6 +660,9 @@ pub async fn show(server: Option<&str>, reference: &str, json: bool) -> Result<(
     if let Some(r) = &s.runner {
         println!("runner:   {}", style::plain(&r.name));
     }
+    if s.agent_kind == Some(AgentKind::Codex) {
+        println!("agent:    Codex");
+    }
     if let Some(m) = &s.model {
         println!("model:    {}", style::plain(m));
     }
@@ -833,6 +852,9 @@ pub async fn edit(server: Option<&str>, args: EditArgs, json: bool) -> Result<()
     let s = resolve(&api, reference).await?;
     let switched = args.model.is_some();
     let settings = switched || args.effort.is_some();
+    if settings && s.agent_kind == Some(AgentKind::Codex) {
+        bail!("Set the model and effort when starting a Codex session.");
+    }
     let s = api
         .update_session(
             &s.id.0,
@@ -1500,7 +1522,7 @@ pub async fn resume(
     Ok(())
 }
 
-/// `fctl take-over`: the session continues on your Claude subscription.
+/// `fctl take-over`: the session continues on your subscription.
 pub async fn take_over(server: Option<&str>, reference: &str, json: bool) -> Result<()> {
     let api = config::api(server)?;
     let s = resolve(&api, reference).await?;
@@ -1509,10 +1531,11 @@ pub async fn take_over(server: Option<&str>, reference: &str, json: bool) -> Res
         return style::print_json(&s);
     }
     println!(
-        "{} {}#{} continues on your Claude subscription",
+        "{} {}#{} continues on your {}",
         style::accent("✓"),
         s.project_slug,
-        s.number
+        s.number,
+        subscription(s.agent_kind)
     );
     Ok(())
 }

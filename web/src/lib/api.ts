@@ -565,6 +565,14 @@ export const api = {
   claudeDefault: (id: string) => request<G.Me>("POST", `/me/claude/${enc(id)}/default`, {}),
   claudeRemove: (id: string) => request<G.Me>("DELETE", `/me/claude/${enc(id)}`),
 
+  codexSettings: () => request<G.CodexSettings>("GET", "/me/codex"),
+  codexSelect: (workspace: string | undefined, connection_id: string | null) =>
+    request<void>("PUT", workspace ? `/me/codex/workspaces/${enc(workspace)}` : "/me/codex/default", {
+      connection_id,
+    } satisfies G.CodexSelection),
+  codexRetry: (id: string) => request<void>("POST", `/me/codex/${enc(id)}/retry`, {}),
+  codexDisconnect: (id: string) => request<void>("DELETE", `/me/codex/${enc(id)}`),
+
   runners: () => request<G.RunnerList>("GET", "/runners"),
   createRunner: (b: G.CreateRunnerRequest) => request<G.RunnerRegistration>("POST", "/runners", b),
   updateRunner: (id: string, b: G.UpdateRunnerRequest) =>

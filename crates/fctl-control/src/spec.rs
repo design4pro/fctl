@@ -17,7 +17,9 @@ use fctl_proto::runner::{
     ClaudeCredential, ClaudeCredentialKind, GitIdentity, ProjectSpec, SessionCredentials,
     SessionRepo, SessionSpec,
 };
-use fctl_proto::session::{GithubAccess, ProjectSettings, PullRequestRef, RepoGrant, RepoRef};
+use fctl_proto::session::{
+    AgentKind, GithubAccess, ProjectSettings, PullRequestRef, RepoGrant, RepoRef,
+};
 use fctl_proto::{ApiError, CredentialId, ErrorCode, ProjectId};
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -83,7 +85,7 @@ pub async fn runner_serves(db: &D1Database, runner_id: &str, session_id: &str) -
              FROM sessions s JOIN projects p ON p.id = s.project_id \
              JOIN runner_workspaces rw ON rw.workspace_id = p.workspace_id AND rw.runner_id = ?1 \
              JOIN runners r ON r.id = rw.runner_id \
-             LEFT JOIN claude_credentials c ON c.id = s.credential_id \
+             LEFT JOIN session_credentials c ON c.id = s.credential_id AND c.agent_kind = COALESCE(s.agent_kind, 'claude') \
              LEFT JOIN workspace_members om ON om.workspace_id = p.workspace_id AND om.user_id = c.user_id \
              WHERE s.id = ?2 AND r.enabled = 1 AND ",
             crate::serves!()
@@ -123,14 +125,15 @@ pub async fn check_runs(db: &D1Database, runner_id: &str, session_id: &str) -> A
     struct Row {
         runner_id: Option<String>,
         credential_id: Option<String>,
+        agent_kind: Option<AgentKind>,
         /// Whose that credential is, while it is there.
         #[serde(default)]
         person: Option<String>,
     }
     let row: Option<Row> = q(
         db,
-        "SELECT s.runner_id, s.credential_id, c.user_id AS person FROM sessions s \
-         LEFT JOIN claude_credentials c ON c.id = s.credential_id WHERE s.id = ?",
+        "SELECT s.runner_id, s.credential_id, s.agent_kind, c.user_id AS person FROM sessions s \
+         LEFT JOIN session_credentials c ON c.id = s.credential_id AND c.agent_kind = COALESCE(s.agent_kind, 'claude') WHERE s.id = ?",
         &[s(session_id)],
     )?
     .first()
@@ -144,13 +147,16 @@ pub async fn check_runs(db: &D1Database, runner_id: &str, session_id: &str) -> A
     if !runner_serves(db, runner_id, session_id).await? {
         return Err(not_served());
     }
-    // Without its Claude connection, nobody runs it, as for its
+    // Without its subscription connection, nobody runs it, as for its
     // credentials: whose it was, its row no longer says.
     let (Some(credential), Some(_)) = (row.credential_id, row.person) else {
-        return Err(connection_gone());
+        return Err(match row.agent_kind.unwrap_or_default() {
+            AgentKind::Claude => connection_gone(),
+            AgentKind::Codex => credential_not_lent(AgentKind::Codex),
+        });
     };
     if !credential_serves(db, &credential, session_id).await? {
-        return Err(credential_not_lent());
+        return Err(credential_not_lent(row.agent_kind.unwrap_or_default()));
     }
     Ok(())
 }
@@ -210,10 +216,10 @@ pub async fn credential_serves(
     let owner: Option<UserRow> = q(
         db,
         &format!(
-            "SELECT {} FROM claude_credentials c JOIN users u ON u.id = c.user_id WHERE c.id = ?",
+            "SELECT {} FROM session_credentials c JOIN users u ON u.id = c.user_id              JOIN sessions s ON s.id = ?2 AND c.agent_kind = COALESCE(s.agent_kind, 'claude')              WHERE c.id = ?1 AND s.credential_id = c.id AND (c.agent_kind = 'claude' OR c.status = 'active')",
             user_columns("u")
         ),
-        &[s(credential_id)],
+        &[s(credential_id), s(session_id)],
     )?
     .first()
     .await?;
@@ -225,13 +231,56 @@ pub async fn credential_serves(
     Ok(role.is_some_and(|r| r.can_message()))
 }
 
-/// The error for a session whose Claude credential no longer runs it
-/// ([`credential_serves`]).
-pub fn credential_not_lent() -> AppError {
-    AppError(ApiError::new(
-        ErrorCode::NotConfigured,
-        "This session ran on the Claude subscription of someone who can no longer run it: they left its workspace or lost their role in its project, or their account is disabled. Resume it to run it on yours.",
-    ))
+#[derive(serde::Deserialize)]
+pub struct CodexUsage {
+    pub credential_id: String,
+    #[serde(deserialize_with = "crate::db::int")]
+    paused: i64,
+    #[serde(deserialize_with = "crate::db::opt_int", default)]
+    reset_at: Option<i64>,
+}
+
+impl CodexUsage {
+    pub fn frame(&self) -> fctl_proto::uplink::UplinkDown {
+        if self.paused == 1 {
+            fctl_proto::uplink::UplinkDown::PauseCodex {
+                reset_at: self.reset_at,
+            }
+        } else {
+            fctl_proto::uplink::UplinkDown::ResumeCodex
+        }
+    }
+}
+
+/// Synchronize a session's usage pause with its assigned connection.
+pub async fn codex_usage_for_session(
+    db: &D1Database,
+    id: &str,
+    now: i64,
+) -> AppResult<Option<CodexUsage>> {
+    q(
+        db,
+        "SELECT c.id AS credential_id, c.reset_at,
+                CASE WHEN c.paused = 1 AND (c.reset_at IS NULL OR c.reset_at > ?2) THEN 1 ELSE 0 END AS paused
+         FROM sessions s JOIN codex_credentials c ON c.id = s.credential_id
+         WHERE s.id = ?1 AND s.agent_kind = 'codex' AND c.status = 'active'",
+        &[s(id), crate::db::n(now)],
+    )?
+    .first()
+    .await
+}
+
+/// The session's subscription connection no longer grants access.
+pub fn credential_not_lent(agent: AgentKind) -> AppError {
+    let message = match agent {
+        AgentKind::Claude => {
+            "This session ran on the Claude subscription of someone who can no longer run it: they left its workspace or lost their role in its project, or their account is disabled. Resume it to run it on yours."
+        }
+        AgentKind::Codex => {
+            "This session's ChatGPT connection is unavailable. Resume it to run on your ChatGPT plan."
+        }
+    };
+    AppError(ApiError::new(ErrorCode::NotConfigured, message))
 }
 
 /// The repositories a project's agents may use besides its primary one.
@@ -243,6 +292,7 @@ pub async fn grants(db: &D1Database, project_id: &str) -> AppResult<Vec<RepoGran
 /// What a queued session asks of a runner.
 #[derive(Clone, Debug, Default)]
 pub struct SessionWants {
+    pub agent: AgentKind,
     /// CPUs and memory.
     pub size: Want,
     /// The image it starts from.
@@ -302,6 +352,7 @@ pub async fn session_wants(
         repo_owner: Option<String>,
         repo_name: Option<String>,
         workspace_id: Option<String>,
+        agent_kind: Option<AgentKind>,
         person: Option<String>,
         person_name: Option<String>,
         #[serde(deserialize_with = "crate::db::int_bool", default)]
@@ -317,7 +368,7 @@ pub async fn session_wants(
     let rows: Vec<Row> = q(
         db,
         "SELECT s.id AS id, p.settings AS settings, p.repo_owner AS repo_owner, p.repo_name AS repo_name, \
-         p.workspace_id AS workspace_id, c.user_id AS person, u.name AS person_name, \
+         p.workspace_id AS workspace_id, s.agent_kind AS agent_kind, c.user_id AS person, u.name AS person_name, \
          om.own_runners AS own_runners, c.on_runners AS on_runners, rv.session_id IS NOT NULL AS review, \
          (ss.snapshot_id IS NOT NULL AND (ss.conversation = 1 OR ss.changes = 1) \
           AND COALESCE(w.snapshots, 0) = 1 \
@@ -327,7 +378,7 @@ pub async fn session_wants(
          FROM sessions s JOIN projects p ON p.id = s.project_id \
          LEFT JOIN workspaces w ON w.id = p.workspace_id \
          LEFT JOIN session_snapshots ss ON ss.session_id = s.id \
-         LEFT JOIN claude_credentials c ON c.id = s.credential_id LEFT JOIN users u ON u.id = c.user_id \
+         LEFT JOIN session_credentials c ON c.id = s.credential_id AND c.agent_kind = COALESCE(s.agent_kind, 'claude') LEFT JOIN users u ON u.id = c.user_id \
          LEFT JOIN workspace_members om ON om.workspace_id = p.workspace_id AND om.user_id = c.user_id \
          LEFT JOIN reviews rv ON rv.session_id = s.id \
          WHERE s.id IN (SELECT value FROM json_each(?1))",
@@ -348,6 +399,7 @@ pub async fn session_wants(
                 _ => None,
             };
             let wants = SessionWants {
+                agent: r.agent_kind.unwrap_or_default(),
                 size: Want::of(&settings),
                 image: ImageWant::of(&settings, repo.as_ref()),
                 workspace_id: r.workspace_id.unwrap_or_default(),
@@ -367,6 +419,7 @@ pub async fn session_wants(
 }
 
 pub async fn build(
+    env: &worker::Env,
     db: &D1Database,
     cfg: &Config,
     keys: &Keys,
@@ -382,15 +435,24 @@ pub async fn build(
     let cred_id = row.credential_id.clone().ok_or_else(|| {
         AppError(ApiError::new(
             ErrorCode::NotConfigured,
-            "The session has no Claude credential",
+            "The session has no subscription connection",
         ))
     })?;
     if !credential_serves(db, &cred_id, &row.id).await? {
-        return Err(credential_not_lent());
+        return Err(credential_not_lent(row.agent()));
     }
-    let claude = claude_credential(cfg, db, keys, &cred_id, now).await?;
+    let mut credentials = match row.agent() {
+        AgentKind::Claude => SessionCredentials {
+            claude: Some(claude_credential(cfg, db, keys, &cred_id, now).await?),
+            ..SessionCredentials::default()
+        },
+        AgentKind::Codex => SessionCredentials {
+            codex: Some(crate::codex::access_token(env, db, &cred_id, now).await?),
+            ..SessionCredentials::default()
+        },
+    };
     if let Some(review) = crate::reviews::of_session(db, &row.id).await? {
-        return review_spec(db, cfg, &row, &project, &review, claude, now).await;
+        return review_spec(db, cfg, &row, &project, &review, credentials, now).await;
     }
     let repo = project.repo();
     let grants = grants(db, &project.id).await?;
@@ -475,8 +537,11 @@ pub async fn build(
     // the workspace keep them. FleetDO leaves it out for hosts that don't
     // announce snapshots.
     let snapshot = crate::snapshots::spec(db, keys, &instance, &row.id, false, now).await?;
+    credentials.github = tokens.write;
+    credentials.github_read = tokens.read;
     Ok(SessionSpec {
         session_id: row.session_id(),
+        agent_kind: row.agent_kind,
         number: row.number.max(0) as u32,
         title: row.title.clone(),
         project: ProjectSpec {
@@ -514,11 +579,7 @@ pub async fn build(
         model: row.model.clone(),
         effort: row.effort.clone(),
         secrets,
-        credentials: SessionCredentials {
-            claude,
-            github: tokens.write,
-            github_read: tokens.read,
-        },
+        credentials,
         git_author,
         co_authors: Vec::new(),
         co_authored_by: author.into_iter().collect(),
@@ -570,7 +631,7 @@ async fn review_spec(
     row: &SessionRow,
     project: &ProjectRow,
     review: &crate::reviews::ReviewRow,
-    claude: ClaudeCredential,
+    mut credentials: SessionCredentials,
     now: i64,
 ) -> AppResult<SessionSpec> {
     let reviewed = review
@@ -647,6 +708,9 @@ async fn review_spec(
         // What a pull request steers its agent to download must not reach
         // the project's other sessions.
         package_caches: false,
+        agent_kind: p.agent_kind,
+        codex_model: p.codex_model.clone(),
+        codex_effort: p.codex_effort.clone(),
         model: p.model.clone(),
         effort: p.effort.clone(),
         compact_window: p.compact_window,
@@ -701,8 +765,11 @@ async fn review_spec(
         conf.as_ref().is_some_and(|c| c.description_summary),
         conf.as_ref().and_then(|c| c.instructions.as_deref()),
     );
+    credentials.github = tokens.write;
+    credentials.github_read = tokens.read;
     Ok(SessionSpec {
         session_id: row.session_id(),
+        agent_kind: row.agent_kind,
         number: row.number.max(0) as u32,
         title: row.title.clone(),
         project: ProjectSpec {
@@ -732,11 +799,7 @@ async fn review_spec(
         model: row.model.clone(),
         effort: row.effort.clone(),
         secrets: Default::default(),
-        credentials: SessionCredentials {
-            claude,
-            github: tokens.write,
-            github_read: tokens.read,
-        },
+        credentials,
         git_author: bot_identity(cfg, now).await,
         co_authors: Vec::new(),
         co_authored_by: Vec::new(),

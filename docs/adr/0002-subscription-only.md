@@ -2,6 +2,9 @@
 
 2026-10-17 · accepted
 
+[ADR 0102](0102-sessions-can-run-codex-on-a-chatgpt-plan.md) applies this
+principle to Codex.
+
 ## Context
 
 Claude Code can authenticate with API keys (billed per token) or with a

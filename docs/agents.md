@@ -105,6 +105,11 @@ agent to reach their account, or their workspaces' people, settings and
 runners. Either way, the sessions the agent starts run as the person, on
 their Claude subscription.
 
+On a [Codex-enabled instance](self-hosting.md#enable-codex), start a session
+with `fctl run --agent codex`. Follow it with the same commands you use for
+Claude. Operators select an agent when configuring schedules, reviews and
+autopilots.
+
 ## Commands that return, and commands that follow
 
 Most commands do one thing and return. Three keep running:

@@ -168,6 +168,11 @@ pays for, choose which one each workspace's sessions run on in **Settings
 → Workspaces** (`fctl workspaces claude <connection> -w acme`, with the
 name or id `fctl claude status` shows).
 
+On an instance with [Codex enabled](self-hosting.md#enable-codex), connect
+your ChatGPT plan with `fctl codex connect` and select Codex when starting
+a session. Settings → Codex shows your connections and lets you choose one
+for each workspace.
+
 ## 5. Bring a machine online
 
 A workspace's sessions run only on its runners: until one is online, they

@@ -34,6 +34,7 @@ export function Composer({
   choices,
   onTakeOver,
   limitOf,
+  agent,
   movedOn,
 }: {
   status?: G.SessionStatus;
@@ -54,6 +55,7 @@ export function Composer({
   onTakeOver?: () => void;
   /** Whose subscription's limit it waits for, when not yours. */
   limitOf?: string;
+  agent?: G.AgentKind;
   /** An earlier session of an autopilot's own: where it works now, which a message goes to instead. */
   movedOn?: MovedOn;
 }) {
@@ -68,9 +70,10 @@ export function Composer({
   const ref = useRef<HTMLTextAreaElement>(null);
   // A message resumes a stopped session; a failed one needs its owner to resume it.
   const resumes = status === "stopped" || status === "stopping";
-  const failed = status === "failed";
+  const pausedCodex = agent === "codex" && status === "paused";
+  const needsResume = status === "failed" || pausedCodex;
   const canWrite = role === "editor" || role === "owner";
-  const canSend = canWrite && (!failed || role === "owner");
+  const canSend = canWrite && (!needsResume || role === "owner");
   const running = status === "running" || status === "provisioning" || status === "preparing";
   const typing = viewers.filter((v) => v.user.id !== meId && v.typing_at && Date.now() - v.typing_at < 6000);
   const files = useAttachments(canSend ? { session: sessionId } : undefined);
@@ -109,7 +112,7 @@ export function Composer({
       restore = taken.restore;
       setText("");
       if (where === "there" && movedOn) await movedOn.send(t, taken.files);
-      else if (failed) await onResume(t, taken.files);
+      else if (needsResume) await onResume(t, taken.files);
       else await onSend(t, taken.files);
       if (where === "here" && movedOn) setAnyway(sessionId);
       setAsking(undefined);
@@ -140,7 +143,9 @@ export function Composer({
     return (
       <div className="rounded-xl border border-line bg-surface/80 px-4 py-3 text-center text-[13px] text-ink-4">
         {canWrite
-          ? "This session failed. Its owner can resume it."
+          ? pausedCodex
+            ? "This session is paused. Its owner can resume it."
+            : "This session failed. Its owner can resume it."
           : "You can follow this session. Ask its owner for the editor role to message the agent."}
       </div>
     );
@@ -153,7 +158,7 @@ export function Composer({
           to={movedOn}
           nudge={asked}
           sending={sending}
-          resume={failed}
+          resume={needsResume}
           onThere={() => void submit("there")}
           onHere={() => void submit("here")}
           onClose={keepEditing}
@@ -170,7 +175,8 @@ export function Composer({
           onTakeOver && (
             <span className="animate-fade flex min-w-0 items-center gap-1.5">
               <span className="truncate">
-                {limitOf ? `${limitOf}'s` : "This"} subscription is at its limit.
+                {limitOf ? `${limitOf}'s` : "This"} {agent === "codex" ? "ChatGPT plan" : "subscription"} is
+                at its limit.
               </span>
               <button
                 type="button"
@@ -215,7 +221,7 @@ export function Composer({
             files.add(pasted, { pasted: true });
           }}
           placeholder={
-            failed
+            needsResume
               ? "Resume the session with a message…"
               : resumes
                 ? "Message the agent to resume the session…"
@@ -242,7 +248,11 @@ export function Composer({
                 choices && "max-sm:hidden",
               )}
             >
-              {failed ? "↵ resume" : resumes ? "↵ send and resume · ⇧↵ new line" : "↵ send · ⇧↵ new line"}
+              {needsResume
+                ? "↵ resume"
+                : resumes
+                  ? "↵ send and resume · ⇧↵ new line"
+                  : "↵ send · ⇧↵ new line"}
             </span>
           </div>
           <div className="flex shrink-0 items-center gap-1.5">
@@ -257,7 +267,7 @@ export function Composer({
             )}
             <button
               type="button"
-              aria-label={failed ? "Resume" : "Send"}
+              aria-label={needsResume ? "Resume" : "Send"}
               disabled={!ready || !!sending}
               onClick={() => void submit()}
               className={cn(

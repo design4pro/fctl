@@ -25,7 +25,7 @@ use crate::access;
 use crate::ctx::{Authed, AutopilotCaller, Ctx};
 use crate::db::{Query, int, int_bool, n, opt_int, os, q, s};
 use crate::error::{AppError, AppResult, forbidden, not_found};
-use crate::model::{CredentialRow, PROJECT_SELECT, ProjectRow, UserRow, user_columns};
+use crate::model::{PROJECT_SELECT, ProjectRow, UserRow, user_columns};
 use fctl_domain::autopilot::{self as ap, Gate};
 use fctl_domain::limits::{Limits, Places};
 use fctl_proto::api::{
@@ -83,6 +83,8 @@ pub struct AutopilotRow {
     pub crew_max: i64,
     pub model: Option<String>,
     pub effort: Option<String>,
+    #[serde(default)]
+    pub agent_kind: Option<fctl_proto::session::AgentKind>,
     /// Where a fresh session takes over from its own, in tokens of context.
     #[serde(deserialize_with = "opt_int", default)]
     pub handoff_at: Option<i64>,
@@ -125,7 +127,7 @@ pub struct AutopilotRow {
 
 pub const AUTOPILOT_SELECT: &str = "SELECT a.project_id, a.workspace_id, a.scope, a.state, a.paused_reason, \
     a.paused_by, a.paused_at, a.owner_id, a.keep_owner, a.direction, a.direction_by, a.direction_at, a.direction_new, a.plan, \
-    a.plan_at, a.powers, a.check_in_minutes, a.crew_max, a.model, a.effort, a.handoff_at, a.session_id, a.wake_at, a.wake_reasons, \
+    a.plan_at, a.powers, a.check_in_minutes, a.crew_max, a.model, a.effort, a.agent_kind, a.handoff_at, a.session_id, a.wake_at, a.wake_reasons, \
     a.asked_wake_at, a.woken_at, a.check_ins, a.failures, a.created_at, a.updated_at, \
     ou.name AS owner_name, ou.avatar_url AS owner_avatar, pu.name AS paused_by_name, pu.avatar_url AS paused_by_avatar, \
     du.name AS direction_by_name, du.avatar_url AS direction_by_avatar, \
@@ -559,7 +561,7 @@ async fn audit(
 /// workspace.
 pub struct Owner {
     pub user: UserRow,
-    pub credential: CredentialRow,
+    pub credential: crate::api::sessions::SessionConnection,
 }
 
 /// Its owner, or why it can't run on their subscription and act as them:
@@ -618,9 +620,15 @@ pub async fn owner(
             ));
         }
     }
+    let agent = row.agent_kind.unwrap_or_default();
     let credential =
-        crate::api::sessions::credential_for(db, &user, project.workspace_id()).await?;
+        crate::api::sessions::connection_for(db, &user, project.workspace_id(), agent).await?;
     let Some(credential) = credential else {
+        if agent == fctl_proto::session::AgentKind::Codex {
+            return Ok(Err(
+                "The autopilot's owner needs to connect a ChatGPT plan.".into(),
+            ));
+        }
         return Ok(Err(
             "It runs on its owner's Claude subscription, and its owner has no Claude connection: they connect one in Settings → Claude, or someone who manages the project takes it over."
                 .into(),
@@ -653,6 +661,14 @@ pub async fn problem(
     Ok(match owner(db, project, row).await? {
         Err(why) => Some(format!("{why} It pauses when it next wakes.")),
         Ok(o) => {
+            if crate::schedules::codex_recheck_at(db, &o.credential, now)
+                .await?
+                .is_some()
+            {
+                return Ok(Some(
+                    "The owner's ChatGPT connection is at its usage limit.".into(),
+                ));
+            }
             let limits = crate::schedules::usage_of(db, &o.credential.id).await?;
             fctl_domain::schedules::at_limit(&limits, now).map(|limit| {
                 let zone = fctl_domain::cron::Utc;
@@ -893,6 +909,18 @@ async fn take_up(env: &Env, db: &D1Database, row: &AutopilotRow, now: i64) -> Ap
         }
         // Its owner's plan at its limit: it wakes once the limit resets, with
         // what it would have woken for.
+        if let Some(recheck) = crate::schedules::codex_recheck_at(db, &owner.credential, now).await? {
+            q(
+                db,
+                "UPDATE autopilots SET wake_at = ?, wake_reasons = ? WHERE project_id = ? AND state = 'on'",
+                &[
+                    n(recheck),
+                    s(&reasons.iter().map(|r| r.as_str()).collect::<Vec<_>>().join(",")),
+                    s(&row.project_id),
+                ],
+            )?.run().await?;
+            return Ok(true);
+        }
         let limits = crate::schedules::usage_of(db, &owner.credential.id).await?;
         if let Some(limit) = fctl_domain::schedules::at_limit(&limits, now) {
             let resets = limit
@@ -1126,6 +1154,7 @@ async fn take_up(env: &Env, db: &D1Database, row: &AutopilotRow, now: i64) -> Ap
 /// waiting for a message, finish their run where they are. `?1`: its home
 /// project, `?2`: the connection, `?3`: a week ago.
 const CREW_TO_MOVE: &str = "autopilot_id = ?1 AND autopilot_role = 'crew' AND credential_id IS NOT ?2 \
+    AND COALESCE(agent_kind, 'claude') = COALESCE((SELECT a.agent_kind FROM autopilots a WHERE a.project_id = ?1), 'claude') \
     AND (status IN ('paused', 'queued', 'stopping') OR (status = 'stopped' AND updated_at > ?3))";
 
 /// How many of its sessions one wake moves at most; the next wake moves more.
@@ -4418,6 +4447,60 @@ mod tests {
             many.err()
                 .is_some_and(|e| e.0.message.starts_with("It keeps at most 100 files"))
         );
+        Ok(())
+    }
+
+    #[wasm_bindgen_test]
+    async fn codex_autopilot_uses_its_owners_chatgpt_connection_and_limit() -> AppResult<()> {
+        use fctl_proto::session::AgentKind;
+
+        let db = testing::database();
+        autopilot(&db).await?;
+        q(
+            &db,
+            "UPDATE users SET default_credential_id = 'crd_old' WHERE id = 'usr_ada'",
+            &[],
+        )?
+        .run()
+        .await?;
+        q(
+            &db,
+            "UPDATE autopilots SET agent_kind = 'codex' WHERE project_id = 'prj_web'",
+            &[],
+        )?
+        .run()
+        .await?;
+        let row = row_of(&db).await?;
+        let project: ProjectRow = q(
+            &db,
+            &format!("{PROJECT_SELECT} WHERE p.id = ?2"),
+            &[s("usr_ada"), s("prj_web")],
+        )?
+        .first()
+        .await?
+        .ok_or_else(|| internal("no project"))?;
+        assert_eq!(row.agent_kind, Some(AgentKind::Codex));
+        assert!(
+            problem(&db, &project, &row, NOW)
+                .await?
+                .is_some_and(|why| why.contains("needs to connect a ChatGPT plan"))
+        );
+
+        let keys = crate::crypto::Keys::derive(&[42; 32]);
+        let link = crate::codex::dev_seed(&db, &keys, "usr_ada", NOW).await?;
+        let owner = owner(&db, &project, &row).await?.map_err(internal)?;
+        assert_eq!(owner.user.id, "usr_ada");
+        assert_eq!(owner.credential.agent, AgentKind::Codex);
+        assert_eq!(owner.credential.id, link.id.as_str());
+        assert_eq!(problem(&db, &project, &row, NOW).await?, None);
+        crate::codex::pause(&db, link.id.as_str(), None).await?;
+        assert!(
+            problem(&db, &project, &row, NOW + HOUR)
+                .await?
+                .is_some_and(|why| why.contains("ChatGPT connection is at its usage limit"))
+        );
+        crate::codex::retry(&db, link.id.as_str()).await?;
+        assert_eq!(problem(&db, &project, &row, NOW + HOUR).await?, None);
         Ok(())
     }
 }

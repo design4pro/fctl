@@ -190,6 +190,7 @@ async fn view(
         crew_max: row.crew_max(),
         model: row.model.clone(),
         effort: row.effort.clone(),
+        agent_kind: row.agent_kind,
         handoff_at: row.handoff_at(),
         fresh_asked: row.state() == AutopilotState::On
             && row.reasons().contains(&AutopilotWakeReason::Fresh),
@@ -701,6 +702,13 @@ async fn brief_of(
 pub async fn put(ctx: &mut Ctx, req: &mut Request, id: &str) -> AppResult<Response> {
     let body: PutAutopilotRequest = http::body(req).await?;
     let l = load(ctx, id).await?;
+    let stored_agent = l
+        .row
+        .as_ref()
+        .and_then(|row| row.agent_kind)
+        .unwrap_or_default();
+    let agent = body.agent_kind.unwrap_or(stored_agent);
+    let change_agent = agent != stored_agent;
     if ctx.autopilot().is_some() {
         return Err(forbidden("An autopilot doesn't change itself: people do."));
     }
@@ -731,7 +739,7 @@ pub async fn put(ctx: &mut Ctx, req: &mut Request, id: &str) -> AppResult<Respon
             if e.is_empty() || e == "default" {
                 Ok(None)
             } else {
-                fctl_domain::validate::effort(e).map(Some)
+                crate::api::sessions::agent_effort(agent, e).map(Some)
             }
         })
         .transpose()
@@ -810,14 +818,7 @@ pub async fn put(ctx: &mut Ctx, req: &mut Request, id: &str) -> AppResult<Respon
                     ));
                 }
             }
-            if crate::api::sessions::credential_for(&ctx.db, &me, l.p.workspace_id())
-                .await?
-                .is_none()
-            {
-                return Err(conflict(
-                    "Connect your Claude subscription first (Settings → Claude): the autopilot runs on it.",
-                ));
-            }
+            crate::api::sessions::require_connection(ctx, &me, l.p.workspace_id(), agent).await?;
             ctx.verified(Sensitive::PutOnAutopilot)?;
             let check_in = check_in
                 .or(before.as_ref().map(AutopilotRow::check_in))
@@ -838,8 +839,8 @@ pub async fn put(ctx: &mut Ctx, req: &mut Request, id: &str) -> AppResult<Respon
                 &ctx.db,
                 "INSERT INTO autopilots (project_id, workspace_id, scope, state, owner_id, keep_owner, direction, direction_by, \
                  direction_at, direction_new, powers, check_in_minutes, crew_max, model, effort, handoff_at, wake_at, wake_reasons, \
-                 failures, created_by, created_at, updated_at) \
-                 VALUES (?1, ?2, ?3, 'on', ?4, ?12, ?5, ?4, ?6, 0, ?7, ?8, ?9, ?10, ?11, ?13, ?6, 'started', 0, ?4, ?6, ?6) \
+                 failures, created_by, created_at, updated_at, agent_kind) \
+                 VALUES (?1, ?2, ?3, 'on', ?4, ?12, ?5, ?4, ?6, 0, ?7, ?8, ?9, ?10, ?11, ?13, ?6, 'started', 0, ?4, ?6, ?6, ?14) \
                  ON CONFLICT (project_id) DO UPDATE SET workspace_id = excluded.workspace_id, scope = excluded.scope, \
                  state = 'on', paused_reason = NULL, paused_by = NULL, paused_at = NULL, owner_id = excluded.owner_id, \
                  keep_owner = excluded.keep_owner, \
@@ -848,7 +849,7 @@ pub async fn put(ctx: &mut Ctx, req: &mut Request, id: &str) -> AppResult<Respon
                  direction_at = CASE WHEN autopilots.direction = excluded.direction THEN autopilots.direction_at \
                    ELSE excluded.direction_at END, direction_new = 0, \
                  powers = excluded.powers, check_in_minutes = excluded.check_in_minutes, crew_max = excluded.crew_max, \
-                 model = excluded.model, effort = excluded.effort, handoff_at = excluded.handoff_at, session_id = NULL, \
+                 model = excluded.model, effort = excluded.effort, handoff_at = excluded.handoff_at, session_id = NULL, agent_kind = excluded.agent_kind, \
                  wake_at = excluded.wake_at, \
                  wake_reasons = 'started', asked_wake_at = NULL, failures = 0, updated_at = excluded.updated_at",
                 &[
@@ -865,14 +866,17 @@ pub async fn put(ctx: &mut Ctx, req: &mut Request, id: &str) -> AppResult<Respon
                     // else the one it had.
                     os(match &model {
                         Some(m) => m.as_deref(),
-                        None => before.as_ref().and_then(|b| b.model.as_deref()),
+                        None if !change_agent => before.as_ref().and_then(|b| b.model.as_deref()),
+                        None => None,
                     }),
                     os(match &effort {
                         Some(e) => e.as_deref(),
-                        None => before.as_ref().and_then(|b| b.effort.as_deref()),
+                        None if !change_agent => before.as_ref().and_then(|b| b.effort.as_deref()),
+                        None => None,
                     }),
                     crate::db::b(keep_owner),
                     on(handoff.map(i64::from)),
+                    os((agent == fctl_proto::session::AgentKind::Codex).then_some(agent.as_str())),
                 ],
             )?
             .run()
@@ -945,7 +949,8 @@ pub async fn put(ctx: &mut Ctx, req: &mut Request, id: &str) -> AppResult<Respon
                 .map_err(AppError)?;
             // What spends its owner's subscription, changed by someone else,
             // runs it on theirs from now on, unless its owner keeps it.
-            let costs = check_in.is_some_and(|c| c != row.check_in())
+            let costs = change_agent
+                || check_in.is_some_and(|c| c != row.check_in())
                 || crew.is_some_and(|c| c != row.crew_max())
                 || model
                     .as_ref()
@@ -956,6 +961,11 @@ pub async fn put(ctx: &mut Ctx, req: &mut Request, id: &str) -> AppResult<Respon
                 || handoff.is_some_and(|h| h != row.handoff_at());
             let mine = row.owner_id.as_deref() == Some(me.id.as_str());
             let take_over = takes_over(ctx, &l.p, &row, mine, body.take_over, costs).await?;
+            if change_agent && !mine && !take_over {
+                return Err(forbidden(
+                    "Take over the autopilot to change the agent it runs on.",
+                ));
+            }
             // Whether it stays on its owner's subscription is theirs to
             // choose: the new owner's, once someone takes it over, who
             // starts without it unless they ask.
@@ -970,15 +980,9 @@ pub async fn put(ctx: &mut Ctx, req: &mut Request, id: &str) -> AppResult<Respon
             } else {
                 row.keep_owner
             };
-            if take_over {
-                if crate::api::sessions::credential_for(&ctx.db, &me, l.p.workspace_id())
-                    .await?
-                    .is_none()
-                {
-                    return Err(conflict(
-                        "Connect your Claude subscription first (Settings → Claude): from now on the autopilot runs on it.",
-                    ));
-                }
+            if take_over || change_agent {
+                crate::api::sessions::require_connection(ctx, &me, l.p.workspace_id(), agent)
+                    .await?;
                 ctx.verified(Sensitive::PutOnAutopilot)?;
             }
             // Keeping it lets others spend its owner's plan: theirs to
@@ -1006,8 +1010,8 @@ pub async fn put(ctx: &mut Ctx, req: &mut Request, id: &str) -> AppResult<Respon
                  crew_max = COALESCE(?6, crew_max), \
                  model = CASE WHEN ?7 THEN ?8 ELSE model END, effort = CASE WHEN ?9 THEN ?10 ELSE effort END, \
                  owner_id = CASE WHEN ?11 THEN ?2 ELSE owner_id END, keep_owner = ?13, \
-                 handoff_at = CASE WHEN ?16 THEN ?17 ELSE handoff_at END, updated_at = ?3 \
-                 WHERE project_id = ?12 AND owner_id IS ?14 AND keep_owner = ?15",
+                 handoff_at = CASE WHEN ?16 THEN ?17 ELSE handoff_at END, updated_at = ?3, agent_kind = ?18 \
+                 WHERE project_id = ?12 AND owner_id IS ?14 AND keep_owner = ?15 AND agent_kind IS ?19",
                 &[
                     os(new_direction.as_deref()),
                     s(&me.id),
@@ -1015,9 +1019,9 @@ pub async fn put(ctx: &mut Ctx, req: &mut Request, id: &str) -> AppResult<Respon
                     os(powers.as_ref().map(|p| ap::store_powers(p)).as_deref()),
                     on(check_in.map(i64::from)),
                     on(crew.map(i64::from)),
-                    crate::db::b(model.is_some()),
+                    crate::db::b(model.is_some() || change_agent),
                     os(model.clone().flatten().as_deref()),
-                    crate::db::b(effort.is_some()),
+                    crate::db::b(effort.is_some() || change_agent),
                     os(effort.clone().flatten().as_deref()),
                     crate::db::b(take_over),
                     s(&row.project_id),
@@ -1026,6 +1030,8 @@ pub async fn put(ctx: &mut Ctx, req: &mut Request, id: &str) -> AppResult<Respon
                     crate::db::b(row.keep_owner),
                     crate::db::b(handoff.is_some()),
                     on(handoff.flatten().map(i64::from)),
+                    os(body.agent_kind.or(row.agent_kind).map(fctl_proto::session::AgentKind::as_str)),
+                    os(row.agent_kind.map(fctl_proto::session::AgentKind::as_str)),
                 ],
             )?
             .run()
@@ -1047,12 +1053,16 @@ pub async fn put(ctx: &mut Ctx, req: &mut Request, id: &str) -> AppResult<Respon
             // Its sessions run on the old owner's subscription: it wakes
             // now to move them to the new owner's, rather than wait there,
             // perhaps for a limit to reset.
-            if take_over {
+            if take_over || change_agent {
                 engine::nudge(
                     &ctx.env,
                     &ctx.db,
                     &row.project_id,
-                    AutopilotWakeReason::Moved,
+                    if change_agent {
+                        AutopilotWakeReason::Fresh
+                    } else {
+                        AutopilotWakeReason::Moved
+                    },
                     ctx.now,
                 )
                 .await?;
@@ -1391,14 +1401,13 @@ pub async fn resume(ctx: &mut Ctx, id: &str) -> AppResult<Response> {
     let mine = row.owner_id.as_deref() == Some(me.id.as_str());
     let take_over = takes_over(ctx, &l.p, &row, mine, false, true).await?;
     if take_over {
-        if crate::api::sessions::credential_for(&ctx.db, &me, l.p.workspace_id())
-            .await?
-            .is_none()
-        {
-            return Err(conflict(
-                "Connect your Claude subscription first (Settings → Claude): from now on the autopilot runs on it.",
-            ));
-        }
+        crate::api::sessions::require_connection(
+            ctx,
+            &me,
+            l.p.workspace_id(),
+            row.agent_kind.unwrap_or_default(),
+        )
+        .await?;
         ctx.verified(Sensitive::PutOnAutopilot)?;
     }
     // Only one still paused: one taken off meanwhile stays off. Taken

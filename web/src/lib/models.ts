@@ -8,6 +8,13 @@
 import type * as G from "@/gen";
 import { projectGithub, within } from "./github-access";
 
+export const AGENTS: ReadonlyArray<{ value: G.AgentKind; label: string }> = [
+  { value: "claude", label: "Claude" },
+  { value: "codex", label: "Codex" },
+];
+
+export const planName = (agent?: G.AgentKind) => (agent === "codex" ? "ChatGPT plan" : "Claude subscription");
+
 /** Claude Code's aliases for the latest model of each family, as lists show them. */
 export const ALIASES = [
   { value: "opus", label: "Opus" },
@@ -43,6 +50,14 @@ export const EFFORTS = [
   { value: "max", label: "Max" },
 ] as const;
 
+export const CODEX_EFFORTS = [
+  { value: "none", label: "None" },
+  { value: "minimal", label: "Minimal" },
+  ...EFFORTS,
+] as const;
+
+export const effortLevels = (agent?: G.AgentKind) => (agent === "codex" ? CODEX_EFFORTS : EFFORTS);
+
 /**
  * A Claude model's ID (`claude-sonnet-5-5`): its family and version. A snapshot's ID, dated
  * (`claude-opus-4-1-20250805`), doesn't match: by its version alone, it would read as the
@@ -54,7 +69,8 @@ const MODEL_ID = /^claude-(opus|sonnet|haiku|fable)-(\d{1,3})(?:-(\d{1,2}))?$/;
  * A model by its alias's name, by its family and version where it is named by a Claude model's
  * undated ID (`claude-sonnet-5-5` is Sonnet 5.5), or as it is; "" is Claude's default.
  */
-export function modelLabel(model: string): string {
+export function modelLabel(model: string, agent?: G.AgentKind): string {
+  if (agent === "codex") return model || "Codex's default";
   if (!model) return "Claude's default";
   const alias = ALIASES.find((a) => a.value === model);
   if (alias) return alias.label;
@@ -66,14 +82,15 @@ export function modelLabel(model: string): string {
 }
 
 /** An effort level by its name; "" is Claude's default. */
-export const effortLabel = (effort: string) =>
-  effort ? (EFFORTS.find((e) => e.value === effort)?.label ?? effort) : "Claude's default";
+export const effortLabel = (effort: string, agent?: G.AgentKind) =>
+  effort ? (effortLevels(agent).find((e) => e.value === effort)?.label ?? effort) : modelLabel("", agent);
 
 /**
  * The model and effort level of a session about to start ("" is Claude's default), and what its
  * agent may do on GitHub.
  */
 export interface Choice {
+  agent_kind?: G.AgentKind;
   model: string;
   effort: string;
   github: G.GithubAccess;
@@ -87,10 +104,11 @@ export interface Choice {
 type Project = Pick<G.Project, "settings" | "last_model" | "last_effort">;
 
 /** What the project's sessions run with unless they ask for something else. */
-export function projectChoice(p: Project): Choice {
+export function projectChoice(p: Project, agent = p.settings.agent_kind): Choice {
   return {
-    model: p.settings.model?.trim() ?? "",
-    effort: p.settings.effort?.trim() ?? "",
+    ...(agent ? { agent_kind: agent } : {}),
+    model: (agent === "codex" ? p.settings.codex_model : p.settings.model)?.trim() ?? "",
+    effort: (agent === "codex" ? p.settings.codex_effort : p.settings.effort)?.trim() ?? "",
     github: projectGithub(p),
   };
 }
@@ -103,12 +121,15 @@ export function projectChoice(p: Project): Choice {
  * project allows: each session asks anew.
  */
 export function startChoice(p: Project, picked: Partial<Choice> = {}): Choice {
-  const own = projectChoice(p);
+  const own = projectChoice(p, picked.agent_kind ?? p.settings.agent_kind);
+  const sameAgent = (own.agent_kind ?? "claude") === (picked.agent_kind ?? "claude");
+  const last = own.agent_kind !== "codex" && p.settings.agent_kind !== "codex";
   const one = (pick: string | undefined, last: string | undefined, theirs: string) =>
     pick !== undefined && (pick || !theirs) ? pick : last?.trim() || theirs;
   return {
-    model: one(picked.model, p.last_model, own.model),
-    effort: one(picked.effort, p.last_effort, own.effort),
+    ...own,
+    model: one(sameAgent ? picked.model : undefined, last ? p.last_model : undefined, own.model),
+    effort: one(sameAgent ? picked.effort : undefined, last ? p.last_effort : undefined, own.effort),
     github: picked.github && within(picked.github, own.github) ? picked.github : own.github,
   };
 }
@@ -121,9 +142,12 @@ export function startChoice(p: Project, picked: Partial<Choice> = {}): Choice {
 export function asked(
   p: Project,
   c: Choice,
-): Pick<G.CreateSessionRequest, "model" | "effort" | "github_access" | "github_issues"> {
-  const own = projectChoice(p);
+): Pick<G.CreateSessionRequest, "agent_kind" | "model" | "effort" | "github_access" | "github_issues"> {
+  const own = projectChoice(p, c.agent_kind ?? p.settings.agent_kind);
+  const agent_kind =
+    c.agent_kind && c.agent_kind !== (p.settings.agent_kind ?? "claude") ? c.agent_kind : undefined;
   return {
+    ...(agent_kind ? { agent_kind } : {}),
     model: c.model && c.model !== own.model ? c.model : undefined,
     effort: c.effort && c.effort !== own.effort ? c.effort : undefined,
     github_access: c.github !== own.github ? c.github : undefined,
@@ -142,26 +166,28 @@ export interface Offer {
  * The models the composer offers in `p`: Claude's default where the project has it, the
  * aliases, then the models it names by their IDs (the project's, yours, `shown`).
  */
-export function modelOffers(p: Project, shown: string): Offer[] {
-  const own = projectChoice(p).model;
-  const ids = [own, p.last_model?.trim() ?? "", shown].filter(
-    (m, i, all) => m && modelChoice(m) === "id" && all.indexOf(m) === i,
+export function modelOffers(p: Project, shown: string, agent = p.settings.agent_kind): Offer[] {
+  const own = projectChoice(p, agent).model;
+  const last = agent === "codex" || p.settings.agent_kind === "codex" ? "" : (p.last_model?.trim() ?? "");
+  const ids = [own, last, shown].filter(
+    (m, i, all) => m && (agent === "codex" || modelChoice(m) === "id") && all.indexOf(m) === i,
   );
-  return [...(own ? [] : [""]), ...ALIASES.map((a) => a.value), ...ids].map((value) => ({
+  const aliases = agent === "codex" ? [] : ALIASES.map((a) => a.value);
+  return [...(own ? [] : [""]), ...aliases, ...ids].map((value) => ({
     value,
-    label: modelLabel(value),
+    label: modelLabel(value, agent),
     own: value === own,
   }));
 }
 
 /** The effort levels the composer offers in `p`: Claude's default where the project has it, the levels, and `shown`. */
-export function effortOffers(p: Project, shown: string): Offer[] {
-  const own = projectChoice(p).effort;
-  const levels: string[] = EFFORTS.map((e) => e.value);
+export function effortOffers(p: Project, shown: string, agent = p.settings.agent_kind): Offer[] {
+  const own = projectChoice(p, agent).effort;
+  const levels: string[] = effortLevels(agent).map((e) => e.value);
   const other = [own, shown].filter((e, i, all) => e && !levels.includes(e) && all.indexOf(e) === i);
   return [...(own ? [] : [""]), ...levels, ...other].map((value) => ({
     value,
-    label: effortLabel(value),
+    label: effortLabel(value, agent),
     own: value === own,
   }));
 }

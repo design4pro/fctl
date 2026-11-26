@@ -160,7 +160,10 @@ pub async fn create(ctx: &mut Ctx, req: &mut Request, project_id: &str) -> AppRe
     )
     .await?;
     let model = optional(body.model.as_deref(), validate::model)?;
-    let effort = optional(body.effort.as_deref(), validate::effort)?;
+    let agent = body.agent_kind.unwrap_or_default();
+    let effort = optional(body.effort.as_deref(), |v| {
+        crate::api::sessions::agent_effort(agent, v)
+    })?;
     let base_branch = optional(body.base_branch.as_deref(), |v| {
         validate::branch("base_branch", v)
     })?;
@@ -179,7 +182,7 @@ pub async fn create(ctx: &mut Ctx, req: &mut Request, project_id: &str) -> AppRe
         )));
     }
     // Its runs start on the caller's subscription, which they need.
-    crate::api::sessions::default_credential(ctx, &user, p.workspace_id()).await?;
+    crate::api::sessions::require_connection(ctx, &user, p.workspace_id(), agent).await?;
     let enabled = body.enabled.unwrap_or(true);
     let next = if enabled {
         when.next(&zone, ctx.now, false)
@@ -191,8 +194,8 @@ pub async fn create(ctx: &mut Ctx, req: &mut Request, project_id: &str) -> AppRe
     q(
         &ctx.db,
         "INSERT INTO schedules (id, project_id, name, prompt, cron, at, timezone, model, effort, base_branch, github_access, \
-         owner_id, enabled, next_run_at, created_by, created_at, updated_by, updated_at, hide_sessions, event_kind, event_filter) \
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?12, ?15, ?12, ?15, ?16, ?17, ?18)",
+         owner_id, enabled, next_run_at, created_by, created_at, updated_by, updated_at, hide_sessions, event_kind, event_filter, agent_kind) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?12, ?15, ?12, ?15, ?16, ?17, ?18, ?19)",
         &[
             s(id.as_str()),
             s(&p.row.id),
@@ -212,6 +215,7 @@ pub async fn create(ctx: &mut Ctx, req: &mut Request, project_id: &str) -> AppRe
             b(body.hide_sessions.unwrap_or(false)),
             os(event_kind.as_deref()),
             os(event_filter.as_deref()),
+            os(body.agent_kind.map(fctl_proto::session::AgentKind::as_str)),
         ],
     )?
     .run()
@@ -240,6 +244,8 @@ pub async fn create(ctx: &mut Ctx, req: &mut Request, project_id: &str) -> AppRe
 pub async fn update(ctx: &mut Ctx, req: &mut Request, id: &str) -> AppResult<Response> {
     let body: UpdateScheduleRequest = http::body(req).await?;
     let (row, p) = schedules::load(ctx, id).await?;
+    let stored_agent = row.agent_kind.unwrap_or_default();
+    let agent = body.agent_kind.unwrap_or(stored_agent);
     let user = ctx.user()?.clone();
     let mine = row.owner_id.as_deref() == Some(user.id.as_str());
     let rights = sch::rights(p.role, mine);
@@ -250,6 +256,7 @@ pub async fn update(ctx: &mut Ctx, req: &mut Request, id: &str) -> AppResult<Res
         || body.prompt.is_some()
         || body.model.is_some()
         || body.effort.is_some()
+        || agent != stored_agent
         || body.base_branch.is_some()
         || body.github_access.is_some();
     // Hiding its sessions or showing them puts nothing on anyone's
@@ -276,8 +283,11 @@ pub async fn update(ctx: &mut Ctx, req: &mut Request, id: &str) -> AppResult<Res
     // A change by anyone else makes it theirs: nobody puts work on someone
     // else's subscription.
     let becomes_mine = !mine && (changes || resumes || takes_over);
-    if becomes_mine {
-        crate::api::sessions::default_credential(ctx, &user, p.workspace_id()).await?;
+    if becomes_mine
+        || agent != stored_agent
+        || (resumes && agent == fctl_proto::session::AgentKind::Codex)
+    {
+        crate::api::sessions::require_connection(ctx, &user, p.workspace_id(), agent).await?;
     }
     let prompt = match body.prompt.as_deref() {
         Some(t) => validate::message("prompt", t)?,
@@ -311,11 +321,13 @@ pub async fn update(ctx: &mut Ctx, req: &mut Request, id: &str) -> AppResult<Res
     let keep = |v: &Option<String>| v.clone();
     let model = match body.model.as_deref() {
         Some(v) => optional(Some(v), validate::model)?,
-        None => keep(&row.model),
+        None if agent == stored_agent => keep(&row.model),
+        None => None,
     };
     let effort = match body.effort.as_deref() {
-        Some(v) => optional(Some(v), validate::effort)?,
-        None => keep(&row.effort),
+        Some(v) => optional(Some(v), |v| crate::api::sessions::agent_effort(agent, v))?,
+        None if agent == stored_agent => keep(&row.effort),
+        None => None,
     };
     let base_branch = match body.base_branch.as_deref() {
         Some(v) => optional(Some(v), |b| validate::branch("base_branch", b))?,
@@ -369,14 +381,15 @@ pub async fn update(ctx: &mut Ctx, req: &mut Request, id: &str) -> AppResult<Res
     // never takes back what the alarm did meanwhile.
     let state = pauses || resumes;
     let retimed = timing || state;
-    q(
+    let written = q(
         &ctx.db,
         "UPDATE schedules SET name = ?1, prompt = ?2, cron = ?3, at = ?4, timezone = ?5, model = ?6, effort = ?7, \
          base_branch = ?8, github_access = ?9, owner_id = ?10, \
          enabled = CASE WHEN ?11 THEN ?12 ELSE enabled END, \
          paused_reason = CASE WHEN ?11 THEN NULL ELSE paused_reason END, \
          next_run_at = CASE WHEN ?13 THEN ?14 ELSE next_run_at END, \
-         updated_by = ?15, updated_at = ?16, hide_sessions = ?18, event_kind = ?19, event_filter = ?20 WHERE id = ?17",
+         updated_by = ?15, updated_at = ?16, hide_sessions = ?18, event_kind = ?19, event_filter = ?20, agent_kind = ?21 \
+         WHERE id = ?17 AND agent_kind IS ?22",
         &[
             s(&name),
             s(&prompt),
@@ -398,10 +411,17 @@ pub async fn update(ctx: &mut Ctx, req: &mut Request, id: &str) -> AppResult<Res
             b(hide_sessions),
             os(event_kind.as_deref()),
             os(event_filter.as_deref()),
+            os(body.agent_kind.or(row.agent_kind).map(fctl_proto::session::AgentKind::as_str)),
+            os(row.agent_kind.map(fctl_proto::session::AgentKind::as_str)),
         ],
     )?
     .run()
     .await?;
+    if written == 0 {
+        return Err(conflict(
+            "The schedule's agent changed. Review its settings and try again.",
+        ));
+    }
     schedules::wake(&ctx.env).await;
     let action = if pauses && row.enabled {
         "schedule.paused"
@@ -520,7 +540,13 @@ pub async fn run(ctx: &mut Ctx, req: &mut Request, id: &str) -> AppResult<Respon
         }
         None => None,
     };
-    let credential = crate::api::sessions::default_credential(ctx, &user, p.workspace_id()).await?;
+    let credential = crate::api::sessions::require_connection(
+        ctx,
+        &user,
+        p.workspace_id(),
+        row.agent_kind.unwrap_or_default(),
+    )
+    .await?;
     let token = ctx.auth.as_ref().is_some_and(|a| a.kind == TokenKind::Pat);
     // A service account runs it for the person it acts for: who the
     // request names, or else the schedule's person

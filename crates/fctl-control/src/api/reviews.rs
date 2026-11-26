@@ -36,6 +36,7 @@ async fn agents(ctx: &Ctx, project: &crate::model::ProjectRow) -> AppResult<Revi
         operator: conf.as_ref().and_then(reviews::SettingsRow::operator),
         model: conf.as_ref().and_then(|c| c.model.clone()),
         effort: conf.as_ref().and_then(|c| c.effort.clone()),
+        agent_kind: conf.as_ref().and_then(|c| c.agent_kind),
         instructions: conf.as_ref().and_then(|c| c.instructions.clone()),
         bots: reviews::bots(conf.as_ref()),
         repos: repos.reviewed,
@@ -58,6 +59,8 @@ pub async fn update_settings(ctx: &mut Ctx, req: &mut Request, id: &str) -> AppR
     let p = access::project(ctx, id).await?;
     let me = ctx.user()?.clone();
     let conf = reviews::settings(&ctx.db, &p.row.id).await?;
+    let stored_agent = conf.as_ref().and_then(|c| c.agent_kind).unwrap_or_default();
+    let agent = body.agent_kind.unwrap_or(stored_agent);
     let mine = conf
         .as_ref()
         .and_then(|c| c.operator_id.as_deref())
@@ -66,6 +69,7 @@ pub async fn update_settings(ctx: &mut Ctx, req: &mut Request, id: &str) -> AppR
         && body.run_as_me.is_none()
         && body.model.is_none()
         && body.effort.is_none()
+        && body.agent_kind.is_none()
         && body.instructions.is_none()
         && body.bots.is_none()
         && body.skipped_repos.is_none()
@@ -84,7 +88,7 @@ pub async fn update_settings(ctx: &mut Ctx, req: &mut Request, id: &str) -> AppR
     };
     let effort = match body.effort.as_deref().map(str::trim) {
         Some("") => Some(None),
-        Some(e) => Some(Some(validate::effort(e)?)),
+        Some(e) => Some(Some(crate::api::sessions::agent_effort(agent, e)?)),
         None => None,
     };
     let instructions = body
@@ -108,8 +112,9 @@ pub async fn update_settings(ctx: &mut Ctx, req: &mut Request, id: &str) -> AppR
         None => rv::stored_skipped(conf.as_ref().and_then(|c| c.skipped_repos.as_deref())),
     };
     let keep = |new: Option<Option<String>>, old: Option<String>| new.unwrap_or(old);
-    let model = keep(model, conf.as_ref().and_then(|c| c.model.clone()));
-    let effort = keep(effort, conf.as_ref().and_then(|c| c.effort.clone()));
+    let prior = conf.as_ref().filter(|_| agent == stored_agent);
+    let model = keep(model, prior.and_then(|c| c.model.clone()));
+    let effort = keep(effort, prior.and_then(|c| c.effort.clone()));
     let instructions = keep(
         instructions,
         conf.as_ref().and_then(|c| c.instructions.clone()),
@@ -126,7 +131,8 @@ pub async fn update_settings(ctx: &mut Ctx, req: &mut Request, id: &str) -> AppR
     };
     // Whether this changes how they review, from what they review with now.
     let settings = conf.as_ref().is_none_or(|c| {
-        model != c.model
+        agent != stored_agent
+            || model != c.model
             || effort != c.effort
             || instructions != c.instructions
             || !rv::same_names(&bots, &reviews::bots(Some(c)))
@@ -158,7 +164,9 @@ pub async fn update_settings(ctx: &mut Ctx, req: &mut Request, id: &str) -> AppR
                 "This project has no repository its agents may write to: link one under Repositories first.",
             ));
         }
-        if crate::api::sessions::credential_for(&ctx.db, &me, p.workspace_id())
+        if agent == fctl_proto::session::AgentKind::Codex {
+            crate::api::sessions::require_connection(ctx, &me, p.workspace_id(), agent).await?;
+        } else if crate::api::sessions::credential_for(&ctx.db, &me, p.workspace_id())
             .await?
             .is_none()
         {
@@ -177,16 +185,17 @@ pub async fn update_settings(ctx: &mut Ctx, req: &mut Request, id: &str) -> AppR
     } else {
         conf.as_ref().and_then(|c| c.operator_id.clone())
     };
-    q(
+    let written = q(
         &ctx.db,
         "INSERT INTO project_reviews (project_id, enabled, operator_id, model, effort, instructions, bots, skipped_repos, \
-         drafts, description_summary, rounds, updated_by, updated_at) \
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13) \
+         drafts, description_summary, rounds, updated_by, updated_at, agent_kind) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14) \
          ON CONFLICT (project_id) DO UPDATE SET \
          enabled = excluded.enabled, operator_id = excluded.operator_id, model = excluded.model, effort = excluded.effort, \
          instructions = excluded.instructions, bots = excluded.bots, skipped_repos = excluded.skipped_repos, \
          drafts = excluded.drafts, description_summary = excluded.description_summary, rounds = excluded.rounds, \
-         updated_by = excluded.updated_by, updated_at = excluded.updated_at",
+         updated_by = excluded.updated_by, updated_at = excluded.updated_at, agent_kind = excluded.agent_kind \
+         WHERE project_reviews.agent_kind IS ?15",
         &[
             s(&p.row.id),
             crate::db::b(enabled),
@@ -201,10 +210,17 @@ pub async fn update_settings(ctx: &mut Ctx, req: &mut Request, id: &str) -> AppR
             n(i64::from(rounds)),
             s(&me.id),
             n(ctx.now),
+            os((agent == fctl_proto::session::AgentKind::Codex).then_some(agent.as_str())),
+            os(conf.as_ref().and_then(|c| c.agent_kind).map(fctl_proto::session::AgentKind::as_str)),
         ],
     )?
     .run()
     .await?;
+    if written == 0 {
+        return Err(conflict(
+            "The review agent changed. Review its settings and try again.",
+        ));
+    }
     let action = match (was_on, enabled, takes_over) {
         (false, true, _) => "reviews.enabled",
         (true, false, _) => "reviews.disabled",

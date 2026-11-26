@@ -11,6 +11,7 @@ export const SETTINGS_TABS = [
   "emails",
   "workspaces",
   "claude",
+  "codex",
   "linear",
   "notifications",
   "appearance",
@@ -44,6 +45,7 @@ export const SETTINGS_GROUPS: readonly (readonly SettingsPage[])[] = [
       label: "Claude",
       keywords: "subscription connection setup-token login usage limits plan remote control",
     },
+    { tab: "codex", label: "Codex", keywords: "chatgpt plan subscription connection usage limits" },
     { tab: "linear", label: "Linear", keywords: "link delegate issues tickets" },
   ],
   [

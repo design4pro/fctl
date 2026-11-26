@@ -517,6 +517,9 @@ show each runner's image and lists.
 
 ## What an image needs
 
+A custom image for Codex sessions must also put Codex CLI 0.172.0 or later
+on the sandbox user's PATH. The default image includes it.
+
 An image that doesn't start from the default one needs what follows
 ([An image from another base](#an-image-from-another-base) builds one on
 Ubuntu, and the sandbox repository's `examples/check.sh` checks an image

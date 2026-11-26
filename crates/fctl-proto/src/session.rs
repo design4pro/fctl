@@ -599,13 +599,47 @@ impl ImageBuild {
     }
 }
 
-/// Settings agents use for a project. Every field has a sensible default, so
-/// clients send only what they change.
+/// The coding agent a session uses with its owner's subscription.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+#[serde(rename_all = "snake_case")]
+pub enum AgentKind {
+    #[default]
+    Claude,
+    Codex,
+}
+
+impl AgentKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Claude => "claude",
+            Self::Codex => "codex",
+        }
+    }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "claude" => Some(Self::Claude),
+            "codex" => Some(Self::Codex),
+            _ => None,
+        }
+    }
+}
+
+/// Settings agents use for a project. Clients send only what they change.
 #[skip_serializing_none]
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[cfg_attr(feature = "ts", derive(ts_rs::TS), ts(optional_fields))]
 #[serde(default)]
 pub struct ProjectSettings {
+    /// Default agent of new sessions. Absent means Claude.
+    pub agent_kind: Option<AgentKind>,
+    #[serialize_always]
+    #[cfg_attr(feature = "ts", ts(optional = nullable))]
+    pub codex_model: Option<String>,
+    #[serialize_always]
+    #[cfg_attr(feature = "ts", ts(optional = nullable))]
+    pub codex_effort: Option<String>,
     /// OCI image for sandboxes. Defaults to the host's configured agent image.
     pub image: Option<String>,
     /// Build the sandbox image from a file in the project's repository
@@ -1098,6 +1132,9 @@ impl Default for ProjectSettings {
             image_build: None,
             setup_script: None,
             package_caches: false,
+            agent_kind: None,
+            codex_model: None,
+            codex_effort: None,
             model: None,
             effort: None,
             compact_window: None,
@@ -1518,6 +1555,10 @@ pub struct Session {
     /// resumes it or takes it over (`POST /sessions/{id}/take-over`).
     /// Absent from control planes before it.
     pub claude: Option<UserRef>,
+    /// The agent selected when this session started.
+    pub agent_kind: Option<AgentKind>,
+    /// The person whose ChatGPT plan this session runs on.
+    pub codex: Option<UserRef>,
     /// The Claude connection it runs on, when it is one of the caller's:
     /// whether taking it over would move it to another of theirs. Absent
     /// for others', from live updates, which go to everyone watching, and

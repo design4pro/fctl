@@ -4,13 +4,14 @@
 //! person starts there, on the Claude subscription of the person it runs
 //! for, whom it names as its starter.
 
+use crate::api::sessions::SessionConnection;
 use crate::db::{n, os, q, s};
 use crate::error::{AppResult, internal};
 use crate::internal::{InitSession, Schedule as Dispatch};
-use crate::model::{CredentialRow, ProjectRow, UserRow};
+use crate::model::{ProjectRow, UserRow};
 use fctl_proto::SessionId;
 use fctl_proto::event::{MessageSource, UserMessage};
-use fctl_proto::session::{GithubAccess, UserRef};
+use fctl_proto::session::{AgentKind, GithubAccess, UserRef};
 use fctl_proto::tickets::TicketMessage;
 use serde::Deserialize;
 use serde_json::Value;
@@ -35,7 +36,7 @@ pub struct NewSession<'a> {
     pub effort: Option<String>,
     /// Who it runs as, on which Claude connection.
     pub user: &'a UserRow,
-    pub credential: &'a CredentialRow,
+    pub credential: &'a SessionConnection,
     pub github_access: GithubAccess,
     /// Its first message, and who sent it: nobody (fctl) for a schedule's
     /// run at its time.
@@ -96,8 +97,8 @@ pub async fn start(env: &Env, db: &D1Database, st: NewSession<'_>) -> AppResult<
         db,
         "INSERT INTO sessions (id, project_id, number, title, prompt, status, created_by, credential_id, branch, base_branch, \
          model, effort, claude_session_id, stats, created_at, updated_at, last_activity_at, github_access, schedule_id, ticket, \
-         autopilot_id, autopilot_role, service_account_id) \
-         VALUES (?, ?, ?, ?, ?, 'queued', ?, ?, ?, ?, ?, ?, ?, '{}', ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+         autopilot_id, autopilot_role, service_account_id, agent_kind) \
+         VALUES (?, ?, ?, ?, ?, 'queued', ?, ?, ?, ?, ?, ?, ?, '{}', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         &[
             s(id.as_str()),
             s(&st.project.id),
@@ -120,6 +121,7 @@ pub async fn start(env: &Env, db: &D1Database, st: NewSession<'_>) -> AppResult<
             os(st.autopilot.as_ref().map(|a| a.project_id)),
             os(st.autopilot.as_ref().map(|a| a.role.as_str())),
             os(st.service_account),
+            os((st.credential.agent == AgentKind::Codex).then_some(st.credential.agent.as_str())),
         ],
     )?
     .run()

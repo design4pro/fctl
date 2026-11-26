@@ -8,13 +8,16 @@
 
 use crate::event::Attachment;
 use crate::session::{
-    GithubAccess, Memory, ProjectSettings, PullRequestRef, RepoAccess, RepoGrant, RepoRef,
-    RunnerRef, SessionStatus, UserRef,
+    AgentKind, GithubAccess, Memory, ProjectSettings, PullRequestRef, RepoAccess, RepoGrant,
+    RepoRef, RunnerRef, SessionStatus, UserRef,
 };
 use crate::{CredentialId, LoginJobId, Millis, ProjectId, SessionId};
 use serde::{Deserialize, Serialize};
 use serde_with::skip_serializing_none;
 use std::collections::BTreeMap;
+
+/// The host and its agent can run Codex sessions.
+pub const FEATURE_CODEX: &str = "codex";
 
 /// A sandbox driver the host knows about.
 #[skip_serializing_none]
@@ -215,6 +218,10 @@ pub struct RunnerDisk {
 pub enum CredentialKind {
     /// A fresh Claude access token (the old one expired or was rejected).
     Claude,
+    /// A fresh ChatGPT plan access token.
+    Codex,
+    /// The Responses API rejected the current ChatGPT access token.
+    CodexRejected,
     /// Fresh GitHub installation tokens for the session's repositories.
     Github,
 }
@@ -260,6 +267,24 @@ pub struct ClaudeAccount {
     /// seeded with it.
     #[cfg_attr(feature = "ts", ts(type = "unknown"))]
     pub raw: Option<serde_json::Value>,
+}
+
+/// The short-lived token the agent uses for ChatGPT plan inference.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+pub struct CodexCredential {
+    pub id: CredentialId,
+    pub access_token: String,
+    pub expires_at: Millis,
+}
+
+impl std::fmt::Debug for CodexCredential {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CodexCredential")
+            .field("id", &self.id)
+            .field("expires_at", &self.expires_at)
+            .finish_non_exhaustive()
+    }
 }
 
 /// What a sandbox needs to run Claude on someone's subscription.
@@ -316,10 +341,11 @@ pub struct GithubCredential {
 }
 
 #[skip_serializing_none]
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, Default)]
 #[cfg_attr(feature = "ts", derive(ts_rs::TS), ts(optional_fields))]
 pub struct SessionCredentials {
-    pub claude: ClaudeCredential,
+    pub claude: Option<ClaudeCredential>,
+    pub codex: Option<CodexCredential>,
     /// For the primary repository and the project's other writable ones.
     pub github: Option<GithubCredential>,
     /// Read-only, for the project's read-only repositories (every repository
@@ -385,6 +411,7 @@ pub struct GitIdentity {
 #[cfg_attr(feature = "ts", derive(ts_rs::TS), ts(optional_fields))]
 pub struct SessionSpec {
     pub session_id: SessionId,
+    pub agent_kind: Option<AgentKind>,
     pub number: u32,
     pub title: String,
     pub project: ProjectSpec,
@@ -783,6 +810,9 @@ pub enum FleetToHost {
         claude: Option<ClaudeCredential>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         #[cfg_attr(feature = "ts", ts(optional))]
+        codex: Option<CodexCredential>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[cfg_attr(feature = "ts", ts(optional))]
         github: Option<GithubCredential>,
         /// See [`SessionCredentials::github_read`].
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -954,7 +984,12 @@ mod tests {
         // Specs and credentials from before it, and those of other
         // connections, say nothing about it.
         let spec: SessionSpec = serde_json::from_value(spec_json())?;
-        assert!(!spec.credentials.claude.on_runners);
+        assert!(
+            spec.credentials
+                .claude
+                .as_ref()
+                .is_some_and(|c| !c.on_runners)
+        );
         let json = serde_json::to_value(&spec)?;
         assert!(json["credentials"]["claude"].get("on_runners").is_none());
 
@@ -964,10 +999,15 @@ mod tests {
             "scopes": ["user:inference"], "on_runners": true
         });
         let spec: SessionSpec = serde_json::from_value(json)?;
-        assert!(spec.credentials.claude.on_runners);
+        assert!(
+            spec.credentials
+                .claude
+                .as_ref()
+                .is_some_and(|c| c.on_runners)
+        );
         assert_eq!(
-            spec.credentials.claude.kind,
-            ClaudeCredentialKind::SetupToken
+            spec.credentials.claude.as_ref().map(|c| c.kind),
+            Some(ClaudeCredentialKind::SetupToken)
         );
 
         // Hellos and heartbeats of older hosts have none; newer ones say

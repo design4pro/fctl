@@ -23,6 +23,7 @@
 pub mod agent;
 pub mod api;
 pub mod autopilot;
+pub mod codex;
 pub mod error;
 pub mod event;
 pub mod hooks;

@@ -24,6 +24,7 @@ import {
   Unplug,
 } from "lucide-react";
 import { type MouseEvent, memo, useId, useMemo, useRef, useState } from "react";
+import { CodexLimitNotice } from "@/components/codex/plan";
 import { Markdown } from "@/components/markdown";
 import { NoteLink } from "@/components/project/memory";
 import { PullRequestSummarizedNotice, ReviewPostedNotice } from "@/components/review";
@@ -627,10 +628,13 @@ export const ItemView = memo(function ItemView({
     case "init":
       return (
         <Milestone icon={<Sparkle />}>
-          Claude Code {item.version ? `${item.version} · ` : ""}
+          {item.agent === "codex" ? "Codex " : "Claude Code "}
+          {item.version ? `${item.version} · ` : ""}
           {item.model}
         </Milestone>
       );
+    case "codex_limit":
+      return <CodexLimitNotice resetAt={item.resetsAt} />;
     case "limit":
       return (
         <Milestone icon={<Hourglass />} tone="warn">

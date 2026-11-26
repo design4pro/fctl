@@ -3,6 +3,7 @@
 
 import {
   Bell,
+  Bot,
   CircleUserRound,
   Cpu,
   Database,
@@ -23,6 +24,7 @@ const ICONS: Record<Exclude<SettingsTab, "linear">, LucideIcon> = {
   emails: Mail,
   workspaces: LayoutGrid,
   claude: Cpu,
+  codex: Bot,
   notifications: Bell,
   appearance: SunMoon,
   log: ScrollText,

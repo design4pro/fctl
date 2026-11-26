@@ -295,11 +295,22 @@ impl Renderer {
                     style::amber(&format!("■ interrupted by {who}"))
                 ));
             }
-            EventBody::Claude(v) => self.claude(v),
+            EventBody::Claude(v) | EventBody::Codex(v) => self.agent_message(v),
+            EventBody::CodexLimit { reset_at, .. } => {
+                self.end_text();
+                let reset = reset_at
+                    .filter(|at| *at > style::now_ms())
+                    .map_or_else(String::new, |at| format!(" · resets {}", style::until(at)));
+                out(&format!(
+                    "{}\nManage usage: {}\n",
+                    style::amber(&format!("◍ ChatGPT usage limit reached{reset}")),
+                    crate::cmd::codex::USAGE_URL
+                ));
+            }
         }
     }
 
-    fn claude(&mut self, v: &Value) {
+    fn agent_message(&mut self, v: &Value) {
         match v.get("type").and_then(Value::as_str) {
             Some("assistant") => {
                 let id = v

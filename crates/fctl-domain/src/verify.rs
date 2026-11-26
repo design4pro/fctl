@@ -75,6 +75,7 @@ pub enum Sensitive {
     /// so a stolen session or token could otherwise have their sessions run
     /// where it watches, for good.
     ConnectClaude,
+    ConnectCodex,
     /// Giving sandboxes one's Claude token again, after keeping it out of
     /// them: their agents can then hand it over, so a stolen session or
     /// token could otherwise have one send it where it waits.
@@ -152,6 +153,7 @@ impl Sensitive {
             NewToken => "make an access token",
             NewAdminToken => "make an admin token",
             ConnectClaude => "connect a Claude subscription",
+            ConnectCodex => "configure a ChatGPT connection",
             GiveClaudeTokenToSandboxes => "give sandboxes your Claude token again",
             LinkLinear => "link a Linear account",
             ApproveCli => "approve the CLI",

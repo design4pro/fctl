@@ -1,5 +1,6 @@
 //! `fctl projects …`
 
+use super::codex::{AgentArg, require_supported};
 use crate::config;
 use crate::style;
 use anyhow::{Context, Result, bail};
@@ -10,8 +11,8 @@ use fctl_proto::api::{
     UpdateMembershipRequest, UpdateProjectRequest,
 };
 use fctl_proto::session::{
-    DEFAULT_PULL_REQUEST_INSTRUCTIONS, FollowUps, GithubAccess, IconStyle, ImageBuild, Project,
-    ProjectIcon, ProjectSettings, RepoAccess, Verbosity, WorkspaceColor,
+    AgentKind, DEFAULT_PULL_REQUEST_INSTRUCTIONS, FollowUps, GithubAccess, IconStyle, ImageBuild,
+    Project, ProjectIcon, ProjectSettings, RepoAccess, Verbosity, WorkspaceColor,
 };
 use std::io::{BufRead, IsTerminal, Read, Write};
 use std::path::{Path, PathBuf};
@@ -193,7 +194,7 @@ pub enum ProjectsCmd {
     /// (maintainers). Sessions take a change of settings when they next
     /// start or resume.
     #[command(
-        group(ArgGroup::new("change").required(true).multiple(true).args(["name", "description", "icon", "icon_color", "icon_style", "default_branch", "model", "effort", "compact_window", "instructions", "instructions_file", "auto_pull_request", "remote_control", "connectors", "credit_people", "credit_claude", "idle_timeout", "runners", "runner_fallback", "publish_screenshots", "screenshot_days", "project_memory", "stale_note_days", "retrospectives", "github", "pr_descriptions", "pr_instructions", "pr_instructions_file", "follow_ups", "tickets", "tickets_repo", "linear_team", "linear_project", "linear_start", "linear_review", "linear_done", "explore_label", "image", "build", "build_context", "setup_script", "package_caches", "env", "unset_env", "cpus", "memory", "id_tokens", "aws_role", "aws_region", "aws_session_tags", "gcp_provider", "gcp_service_account", "azure_tenant", "azure_client"])),
+        group(ArgGroup::new("change").required(true).multiple(true).args(["name", "description", "icon", "icon_color", "icon_style", "default_branch", "agent", "model", "effort", "compact_window", "instructions", "instructions_file", "auto_pull_request", "remote_control", "connectors", "credit_people", "credit_claude", "idle_timeout", "runners", "runner_fallback", "publish_screenshots", "screenshot_days", "project_memory", "stale_note_days", "retrospectives", "github", "pr_descriptions", "pr_instructions", "pr_instructions_file", "follow_ups", "tickets", "tickets_repo", "linear_team", "linear_project", "linear_start", "linear_review", "linear_done", "explore_label", "image", "build", "build_context", "setup_script", "package_caches", "env", "unset_env", "cpus", "memory", "id_tokens", "aws_role", "aws_region", "aws_session_tags", "gcp_provider", "gcp_service_account", "azure_tenant", "azure_client"])),
         after_help = "Examples:\n  fctl projects set --name \"Web app\" --description \"The storefront\"   # its slug stays\n  fctl projects set --description \"\"            # no description\n  fctl projects set --icon store --icon-color yellow --icon-style duotone\n  fctl projects set --icon-color '#2a9d8f'       # a color of its own\n  fctl projects set --icon \"\"                   # the icon that fits its name again\n  fctl projects set --default-branch develop     # sessions start from develop\n  fctl projects set --model opus --effort high    # \"default\" for Claude's own\n  fctl projects set --compact-window 400k        # Claude compacts as its context nears 400K tokens\n  fctl projects set --instructions-file agents.md   # what agents are told in every session\n  fctl projects set --instructions \"\"           # nothing besides fctl's own\n  fctl projects set --auto-pull-request off      # agents open pull requests when asked to\n  fctl projects set --remote-control off --connectors on\n  fctl projects set --credit-claude off          # no Claude trailer\n  fctl projects set -p my-app --credit-people off --credit-claude off   # no trailers at all\n  fctl projects set --idle-timeout 30            # idle sessions keep their sandbox for 30 minutes\n  fctl projects set -p ml --runners gpu          # its sessions wait for a runner of the gpu pool\n  fctl projects set --runners gpu --runner-fallback 15m   # or run on any runner after 15 minutes\n  fctl projects set --runners \"\"                # any runner of the workspace\n  fctl projects set --publish-screenshots on --screenshot-days 7\n  fctl projects set --project-memory off --retrospectives off   # agents keep neither\n  fctl projects set --stale-note-days 7         # fctl deletes notes a week after they go stale (never: kept)\n  fctl projects set -p web --github comment    # its agents review and comment, and never push\n  fctl projects set -p web --github triage     # its agents only label tickets and comment on them\n  fctl projects set --pr-descriptions brief      # pull requests described in a few sentences\n  fctl projects set --pr-instructions-file prs.md   # how agents handle pull requests and issues\n  fctl projects set --pr-instructions default    # fctl's rules for them (\"\" for none)\n  fctl projects set --follow-ups comments,checks,conflicts   # agents come back for @fctl, failed checks and conflicts\n  fctl projects set --tickets linear --linear-team ENG   # tickets in Linear: delegate them to fctl there\n  fctl projects set --linear-team ENG,DES --linear-project DES:Website   # two teams, one of them narrowed\n  fctl projects set --tickets github --tickets-repo acme/web   # one repository's GitHub issues\n  fctl projects set --tickets none               # agents use no ticket tracker\n  fctl projects set --image ghcr.io/acme/agent:1  # sessions start from this image\n  fctl projects set --build .devcontainer/devcontainer.json  # or one built from the repository\n  fctl projects set --setup-script @setup.sh --env NODE_ENV=test\n  fctl projects set --package-caches on          # sessions on a runner share their downloads\n  fctl projects set --cpus 8 --memory 16g"
     )]
     Set {
@@ -214,13 +215,13 @@ pub enum ProjectsCmd {
         /// no commits yet. Sessions that already started keep theirs.
         #[arg(long, value_name = "BRANCH")]
         default_branch: Option<String>,
-        /// The model its agents work with: opus, sonnet, haiku, fable or a
-        /// model's ID; "default" for Claude's own. A session can ask for
-        /// another (`fctl run --model`).
+        /// The coding agent new sessions use by default.
+        #[arg(long, value_enum)]
+        agent: Option<AgentArg>,
+        /// Model alias or ID for the selected agent; "default" to clear it.
         #[arg(long)]
         model: Option<String>,
-        /// Their effort level: low, medium, high, xhigh or max; "default"
-        /// for Claude's own.
+        /// Effort level for the selected agent; "default" to clear it.
         #[arg(long, value_name = "LEVEL")]
         effort: Option<String>,
         /// The context size Claude compacts the conversation near, from
@@ -876,6 +877,14 @@ fn rules(s: &ProjectSettings) -> String {
 
 /// The model and effort a project's agents work with, in words.
 fn model(s: &ProjectSettings) -> String {
+    if s.agent_kind == Some(AgentKind::Codex) {
+        return match (s.codex_model.as_deref(), s.codex_effort.as_deref()) {
+            (None, None) => "Codex's default model and effort".into(),
+            (Some(m), None) => format!("{m}, at Codex's default effort"),
+            (None, Some(e)) => format!("Codex's default model, at {e} effort"),
+            (Some(m), Some(e)) => format!("{m}, at {e} effort"),
+        };
+    }
     match (s.model.as_deref(), s.effort.as_deref()) {
         (None, None) => "Claude's default model and effort".to_owned(),
         (Some(m), None) => format!("{m}, at Claude's default effort"),
@@ -884,7 +893,7 @@ fn model(s: &ProjectSettings) -> String {
     }
 }
 
-/// `--model` and `--effort`: `None` for Claude's own, `default` or `""`.
+/// `--model` and `--effort`: `None` for the agent's default.
 fn or_claudes(arg: &str) -> Option<String> {
     let arg = arg.trim();
     (!arg.is_empty() && !arg.eq_ignore_ascii_case("default")).then(|| arg.to_owned())
@@ -1337,7 +1346,11 @@ pub async fn run(server: Option<&str>, cmd: ProjectsCmd, json: bool) -> Result<(
             println!("memory:  {}", stale_notes(&p.settings));
             println!("model:   {}", model(&p.settings));
             println!("context: {}", fctl_domain::context::describe(&p.settings));
-            println!("claude:  {}", claude_apps(&p.settings));
+            if p.settings.agent_kind == Some(AgentKind::Codex) {
+                println!("agent:   Codex");
+            } else {
+                println!("claude:  {}", claude_apps(&p.settings));
+            }
             println!("github:  agents {}", on_github(&p.settings));
             println!("identity: agents {}", identity(&p.settings));
             println!("prs:     agents {}", pull_requests(&p.settings));
@@ -1402,6 +1415,7 @@ pub async fn run(server: Option<&str>, cmd: ProjectsCmd, json: bool) -> Result<(
             description,
             icon,
             default_branch,
+            agent,
             model: new_model,
             effort,
             compact_window,
@@ -1452,6 +1466,8 @@ pub async fn run(server: Option<&str>, cmd: ProjectsCmd, json: bool) -> Result<(
             azure_client,
         } => {
             let project = super::sessions::project_or_default(project)?;
+            let agent_kind = agent.map(Into::into);
+            require_supported(&api, agent_kind).await?;
             let p = api.project(&project).await?;
             let new_icon = icon.apply(p.icon.as_ref())?;
             let clouds = CloudFlags {
@@ -1493,11 +1509,19 @@ pub async fn run(server: Option<&str>, cmd: ProjectsCmd, json: bool) -> Result<(
                 };
                 b.context = (!dir.trim().is_empty()).then(|| dir.trim().to_owned());
             }
+            if let Some(agent_kind) = agent_kind {
+                settings.agent_kind = Some(agent_kind);
+            }
+            let (model_setting, level) = if settings.agent_kind == Some(AgentKind::Codex) {
+                (&mut settings.codex_model, &mut settings.codex_effort)
+            } else {
+                (&mut settings.model, &mut settings.effort)
+            };
             if let Some(m) = &new_model {
-                settings.model = or_claudes(m);
+                *model_setting = or_claudes(m);
             }
             if let Some(e) = &effort {
-                settings.effort = or_claudes(e);
+                *level = or_claudes(e);
             }
             if let Some(OrDefault(t)) = compact_window {
                 settings.compact_window = t;

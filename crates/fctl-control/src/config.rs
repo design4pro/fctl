@@ -11,6 +11,7 @@
 //! | `FCTL_WEBHOOK_HTTP` | var | `1` where webhooks may post over plain `http://` too (self-hosted; never app.fctl.sh) |
 //! | `FCTL_WEBHOOK_PRIVATE_HOSTS` | var | IP ranges and host names on a private network webhooks may post to (self-hosted; never app.fctl.sh; `fctl_domain::hooks::Reach`) |
 //! | `FCTL_ADMIN_TOKENS` | var | `1` where instance admins make admin tokens, which provision people (self-hosted; never app.fctl.sh; `fctl_domain::admin_tokens`) |
+//! | `FCTL_CODEX_ENABLED` | var | `1` enables ChatGPT plan sign-in on a privately run instance |
 //! | `FCTL_METRICS_TOKEN` | secret | The bearer token Prometheus scrapes runner pools' demand with, at `/api/v1/metrics` (self-hosted; unset: no metrics) |
 //! | `FCTL_MASTER_KEY` | secret | 32 random bytes, base64; encrypts credentials and signs state |
 //! | `FCTL_SETUP_TOKEN` | secret | One-time token for creating the owner account |
@@ -116,6 +117,7 @@ pub struct Config {
     /// instance's deployment may turn them on, app.fctl.sh's never does.
     /// Off, none works and none can be made.
     pub admin_tokens: bool,
+    pub codex_enabled: bool,
     pub github: Option<GithubConfig>,
     /// The GitHub App review agents post their reviews as, where it's
     /// installed on the reviewed repository (`fctl-review`), so that people
@@ -233,6 +235,11 @@ impl Config {
                 .unwrap_or_else(|| "fctl <noreply@fctl.sh>".to_owned()),
         });
         let dev = var(env, "FCTL_DEV").is_some_and(|v| v == "1" || v == "true");
+        let codex_enabled = var(env, "FCTL_CODEX_ENABLED").is_some_and(|v| v == "1" || v == "true")
+            && url::Url::parse(&public_url).is_ok_and(|url| {
+                url.host_str()
+                    .is_some_and(|host| host.trim_end_matches('.') != "app.fctl.sh")
+            });
         let (webhook_reach, webhook_reach_unread) = if dev {
             (fctl_domain::hooks::Reach::anything(), Vec::new())
         } else {
@@ -253,6 +260,7 @@ impl Config {
             webhook_reach,
             webhook_reach_unread,
             admin_tokens: var(env, "FCTL_ADMIN_TOKENS").is_some_and(|v| v == "1" || v == "true"),
+            codex_enabled,
             github,
             github_review,
             linear,

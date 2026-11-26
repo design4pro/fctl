@@ -1,4 +1,4 @@
-//! fctl-agent: the supervisor that runs Claude Code inside a sandbox.
+//! fctl-agent: the supervisor that runs agents inside a sandbox.
 //!
 //! - `fctl-agent serve` runs the supervisor (started detached by the host),
 //!   as root with `--user` in container and VM sandboxes (src/user).
@@ -24,6 +24,7 @@
 mod attachments;
 mod caches;
 mod claude;
+mod codex;
 mod followed;
 mod id_tokens;
 mod journal;
@@ -61,7 +62,7 @@ use std::time::Duration;
 #[command(
     name = "fctl-agent",
     version,
-    about = "Runs Claude Code for fctl inside a sandbox"
+    about = "Runs agents for fctl inside a sandbox"
 )]
 struct Cli {
     #[command(subcommand)]

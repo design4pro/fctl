@@ -271,6 +271,12 @@ pub enum UplinkDown {
     Deliver {
         delivery: Delivery,
     },
+    PauseCodex {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[cfg_attr(feature = "ts", ts(optional))]
+        reset_at: Option<Millis>,
+    },
+    ResumeCodex,
     Pong,
 }
 

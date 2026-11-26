@@ -23,7 +23,7 @@ use fctl_proto::runner::{
     FEATURE_SNAPSHOTS, FEATURE_TRIAGE, FleetToHost, HostHello, HostSessionReport, HostToFleet,
     RunnerClaudeToken, SandboxLimits, StopReason,
 };
-use fctl_proto::session::{GithubAccess, RunnerRef, SessionStatus};
+use fctl_proto::session::{AgentKind, GithubAccess, RunnerRef, SessionStatus};
 use fctl_proto::{ApiError, ErrorCode, LoginJobId, RunnerId, SessionId};
 use serde::{Deserialize, Serialize};
 use std::cell::RefCell;
@@ -50,6 +50,7 @@ const CLOSE_RECHECK: u16 = 4000;
 /// The answer to a host's credential request.
 struct Credentials {
     claude: Option<fctl_proto::runner::ClaudeCredential>,
+    codex: Option<fctl_proto::runner::CodexCredential>,
     github: Option<fctl_proto::runner::GithubCredential>,
     github_read: Option<fctl_proto::runner::GithubCredential>,
 }
@@ -299,6 +300,7 @@ struct Candidate {
     allowed_builds: Option<Vec<String>>,
     /// Its host runs review agents' sessions.
     reviews: bool,
+    codex: bool,
     /// The driver its host uses and why it can't start sandboxes now, as
     /// its host last said; `None` while it can, and from hosts that don't
     /// keep saying ([`FEATURE_DRIVERS`]), whose word may be old.
@@ -369,7 +371,9 @@ impl Candidate {
             name: &self.name,
             online: true,
             enabled: true,
-            serves: self.serves.takes(want) && (!want.on_runners || self.keeps_token()),
+            serves: self.serves.takes(want)
+                && (!want.on_runners || self.keeps_token())
+                && (want.agent != AgentKind::Codex || self.codex),
             capacity: self.capacity,
             active: self.active,
             labels: &self.labels,
@@ -1388,6 +1392,7 @@ impl FleetObject {
                     Ok(c) => FleetToHost::Credential {
                         request_id,
                         claude: c.claude,
+                        codex: c.codex,
                         github: c.github,
                         github_read: c.github_read,
                         error: None,
@@ -1395,6 +1400,7 @@ impl FleetObject {
                     Err(e) => FleetToHost::Credential {
                         request_id,
                         claude: None,
+                        codex: None,
                         github: None,
                         github_read: None,
                         error: Some(e.message),
@@ -2517,7 +2523,7 @@ impl FleetObject {
                 }
             };
             let session_id = SessionId(item.session_id.clone());
-            let built = spec::build(&db, &cfg, &keys, &item.session_id, now).await;
+            let built = spec::build(&self.env, &db, &cfg, &keys, &item.session_id, now).await;
             let spec = match built {
                 Ok(mut s) => {
                     s.run_id = Some(fctl_domain::ids::new_id("run", now));
@@ -2533,6 +2539,11 @@ impl FleetObject {
                         ));
                     }
                     s
+                }
+                Err(e) if want.agent == AgentKind::Codex && e.0.code == ErrorCode::RateLimited => {
+                    self.note_waiting(&item, e.0.message, "chatgpt_usage_limit")
+                        .await;
+                    continue;
                 }
                 Err(e) => {
                     let _ = self.sql.exec(
@@ -2708,6 +2719,10 @@ impl FleetObject {
                     unready,
                     claude_token: hello.claude_token,
                     snapshots: hello.features.iter().any(|f| f == FEATURE_SNAPSHOTS),
+                    codex: hello
+                        .features
+                        .iter()
+                        .any(|f| f == fctl_proto::runner::FEATURE_CODEX),
                     snapshot_bucket: hello
                         .snapshot_store
                         .as_ref()
@@ -3311,12 +3326,12 @@ impl FleetObject {
         let cred_id = row
             .credential_id
             .clone()
-            .ok_or_else(|| ApiError::new(ErrorCode::NotConfigured, "No Claude credential"))?;
+            .ok_or_else(|| ApiError::new(ErrorCode::NotConfigured, "No subscription connection"))?;
         if !spec::credential_serves(&db, &cred_id, session_id.as_str())
             .await
             .map_err(|e| e.0)?
         {
-            return Err(spec::credential_not_lent().0);
+            return Err(spec::credential_not_lent(row.agent()).0);
         }
         match kind {
             CredentialKind::Github => {
@@ -3347,11 +3362,15 @@ impl FleetObject {
                 }
                 Ok(Credentials {
                     claude: None,
+                    codex: None,
                     github: tokens.write,
                     github_read: tokens.read,
                 })
             }
             CredentialKind::Claude => {
+                if row.agent() != AgentKind::Claude {
+                    return Err(ApiError::forbidden("This session uses ChatGPT"));
+                }
                 let keys = crypto::keys(&cfg).map_err(|e| e.0)?;
                 // One refresh per credential at a time; others wait for it.
                 for _ in 0..80 {
@@ -3365,6 +3384,36 @@ impl FleetObject {
                 self.refreshing.borrow_mut().remove(&cred_id);
                 Ok(Credentials {
                     claude: Some(result.map_err(|e| e.0)?),
+                    codex: None,
+                    github: None,
+                    github_read: None,
+                })
+            }
+            CredentialKind::Codex | CredentialKind::CodexRejected => {
+                if row.agent() != AgentKind::Codex
+                    || self.still_stopping(session_id.as_str())
+                    || !self.host_has(runner_id, fctl_proto::runner::FEATURE_CODEX)
+                {
+                    return Err(ApiError::forbidden(
+                        "This runner is not running Codex for this session",
+                    ));
+                }
+                let token = if kind == CredentialKind::CodexRejected {
+                    crate::codex::refresh_access_token(&self.env, &db, &cred_id, now).await
+                } else {
+                    crate::codex::access_token(&self.env, &db, &cred_id, now).await
+                }
+                .map_err(|e| e.0)?;
+                if self.still_stopping(session_id.as_str())
+                    || !self.assigned_to(session_id.as_str(), runner_id)
+                {
+                    return Err(ApiError::forbidden(
+                        "This runner is no longer running this session",
+                    ));
+                }
+                Ok(Credentials {
+                    claude: None,
+                    codex: Some(token),
                     github: None,
                     github_read: None,
                 })
@@ -3834,6 +3883,9 @@ impl FleetObject {
     /// one that no runner of its workspace takes, why
     /// ([`Self::no_runner_takes`]); otherwise what `wait` says.
     fn why_waits(&self, want: &spec::SessionWants, labels: &[String], wait: &Wait) -> String {
+        if want.agent == AgentKind::Codex && matches!(wait, Wait::Workspace) {
+            return "Waiting for an online runner with Codex support in this workspace".into();
+        }
         let pooled = (!labels.is_empty())
             .then(|| self.pool_for(want, labels))
             .flatten()
@@ -4076,7 +4128,7 @@ impl FleetObject {
         let lent: Vec<Lent> = match crate::db::q(
             db,
             "SELECT s.id AS id, s.credential_id AS credential_id, s.runner_id AS runner_id FROM sessions s \
-             JOIN claude_credentials c ON c.id = s.credential_id \
+             JOIN session_credentials c ON c.id = s.credential_id AND c.agent_kind = COALESCE(s.agent_kind, 'claude') \
              WHERE c.user_id IN (SELECT value FROM json_each(?)) \
              AND s.status IN ('queued','provisioning','preparing','running','idle','paused')",
             &[crate::db::s(&users)],
@@ -4160,6 +4212,7 @@ mod tests {
             allowed_images: None,
             allowed_builds: None,
             reviews: false,
+            codex: false,
             unready: None,
             claude_token: None,
             serves: Serves {
@@ -4192,6 +4245,21 @@ mod tests {
         wait: bool,
     ) -> std::result::Result<String, Wait> {
         pick_runner(runners, want, &[], None, wait).map(|(id, _)| id)
+    }
+
+    #[wasm_bindgen_test]
+    fn only_an_explicitly_compatible_runner_takes_codex() {
+        let want = spec::SessionWants {
+            agent: AgentKind::Codex,
+            ..resume(None)
+        };
+        let older = runner("rnr_older", 0, true, None);
+        assert!(picked(&[older], &want, true).is_err());
+        let older = runner("rnr_older", 0, true, None);
+        let mut compatible = runner("rnr_codex", 0, true, None);
+        compatible.codex = true;
+        let picked = pick_runner(&[older, compatible], &want, &[], Some("rnr_older"), true);
+        assert_eq!(picked.ok().map(|(id, _)| id).as_deref(), Some("rnr_codex"));
     }
 
     #[wasm_bindgen_test]

@@ -13,7 +13,7 @@ use fctl_domain::{naming, validate};
 use fctl_proto::api::*;
 use fctl_proto::event::{Attachment, EventBody, Interrupt, MessageSource, UserMessage};
 use fctl_proto::runner::StopReason;
-use fctl_proto::session::{SessionRole, SessionStatus, UserRef};
+use fctl_proto::session::{AgentKind, SessionRole, SessionStatus, UserRef};
 use fctl_proto::uplink::{Delivery, DeliveryKind};
 use fctl_proto::{ApiError, ErrorCode, UserId};
 use worker::{Request, Response};
@@ -73,6 +73,64 @@ pub async fn credential_for(
         .cloned())
 }
 
+pub(crate) struct SessionConnection {
+    pub id: String,
+    pub agent: AgentKind,
+}
+
+pub(crate) async fn connection_for(
+    db: &worker::D1Database,
+    user: &UserRow,
+    workspace_id: &str,
+    agent: AgentKind,
+) -> AppResult<Option<SessionConnection>> {
+    let id = match agent {
+        AgentKind::Claude => credential_for(db, user, workspace_id).await?.map(|c| c.id),
+        AgentKind::Codex => crate::codex::credential_for(db, &user.id, workspace_id).await?,
+    };
+    Ok(id.map(|id| SessionConnection { id, agent }))
+}
+
+pub(crate) async fn require_connection(
+    ctx: &Ctx,
+    user: &UserRow,
+    workspace_id: &str,
+    agent: AgentKind,
+) -> AppResult<SessionConnection> {
+    if agent == AgentKind::Claude {
+        return Ok(SessionConnection {
+            id: default_credential(ctx, user, workspace_id).await?.id,
+            agent,
+        });
+    }
+    crate::codex::require_enabled(&ctx.cfg)?;
+    let connection = connection_for(&ctx.db, user, workspace_id, agent)
+        .await?
+        .ok_or_else(|| {
+            AppError(ApiError::new(
+                ErrorCode::NotConfigured,
+                format!(
+                    "{} needs to connect a ChatGPT plan with `fctl codex connect`",
+                    user.name
+                ),
+            ))
+        })?;
+    if crate::codex::is_paused(&ctx.db, &connection.id, ctx.now).await? {
+        return Err(AppError(ApiError::new(
+            ErrorCode::RateLimited,
+            "This ChatGPT connection is at its usage limit. Review usage in ChatGPT and retry it in Settings → Codex.",
+        )));
+    }
+    Ok(connection)
+}
+
+pub(crate) fn agent_effort(agent: AgentKind, input: &str) -> Result<String, ApiError> {
+    match agent {
+        AgentKind::Claude => validate::effort(input),
+        AgentKind::Codex => validate::codex_effort(input),
+    }
+}
+
 #[derive(serde::Deserialize)]
 struct Counter {
     #[serde(deserialize_with = "crate::db::int")]
@@ -103,6 +161,16 @@ pub async fn create(ctx: &mut Ctx, req: &mut Request, project_id: &str) -> AppRe
         crate::autopilots::crew_room(&ctx.db, a, ctx.now).await?;
     }
     let user = ctx.user()?.clone();
+    let agent = if let Some(a) = &autopilot {
+        crate::spec::session_row(&ctx.db, &a.session_id)
+            .await?
+            .ok_or_else(|| not_found("Autopilot session"))?
+            .agent()
+    } else {
+        body.agent_kind
+            .or(p.row.settings().agent_kind)
+            .unwrap_or_default()
+    };
     let files = validate::attachment_ids(&body.attachments)?;
     let prompt = validate::message_with_files("prompt", &body.prompt, files.len())?;
     // A task of files alone is named after them, before an autopilot's note.
@@ -132,7 +200,7 @@ pub async fn create(ctx: &mut Ctx, req: &mut Request, project_id: &str) -> AppRe
         .effort
         .as_deref()
         .filter(|e| !e.trim().is_empty())
-        .map(validate::effort)
+        .map(|effort| agent_effort(agent, effort))
         .transpose()?;
     let base_branch = body
         .base_branch
@@ -157,7 +225,7 @@ pub async fn create(ctx: &mut Ctx, req: &mut Request, project_id: &str) -> AppRe
             "Only the project's maintainers may start a session that reaches GitHub issues its ticket tracker doesn't",
         ));
     }
-    let credential = default_credential(ctx, &user, p.workspace_id()).await?;
+    let credential = require_connection(ctx, &user, p.workspace_id(), agent).await?;
     let id = fctl_domain::ids::session_id(ctx.now);
     // The task's files belong to the new session from here on.
     let attachments = internal::claim_files(&ctx.env, &p.row.id, &id, &user.id, &files).await?;
@@ -192,8 +260,8 @@ pub async fn create(ctx: &mut Ctx, req: &mut Request, project_id: &str) -> AppRe
         &ctx.db,
         "INSERT INTO sessions (id, project_id, number, title, prompt, prompt_attachments, status, created_by, credential_id, branch, base_branch, model, effort, \
          claude_session_id, stats, created_at, updated_at, last_activity_at, github_access, github_issues, autopilot_id, autopilot_role, \
-         service_account_id) \
-         VALUES (?, ?, ?, ?, ?, ?, 'queued', ?, ?, ?, ?, ?, ?, ?, '{}', ?, ?, ?, ?, ?, ?, ?, ?)",
+         service_account_id, agent_kind) \
+         VALUES (?, ?, ?, ?, ?, ?, 'queued', ?, ?, ?, ?, ?, ?, ?, '{}', ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         &[
             s(id.as_str()),
             s(&p.row.id),
@@ -216,6 +284,7 @@ pub async fn create(ctx: &mut Ctx, req: &mut Request, project_id: &str) -> AppRe
             os(autopilot.as_ref().map(|a| a.project_id.as_str())),
             os(autopilot.as_ref().map(|_| "crew")),
             os(service_account.as_deref()),
+            os((agent == AgentKind::Codex).then_some(agent.as_str())),
         ],
     )?
     .run()
@@ -233,7 +302,8 @@ pub async fn create(ctx: &mut Ctx, req: &mut Request, project_id: &str) -> AppRe
     }
     // Nor is remembering what it asked for: not an autopilot's choice, nor
     // a service account's, which aren't their person's.
-    if autopilot.is_none()
+    if agent == AgentKind::Claude
+        && autopilot.is_none()
         && service_account.is_none()
         && let Err(e) = remember_choice(
             ctx,
@@ -523,6 +593,11 @@ pub async fn get(ctx: &Ctx, id: &str) -> AppResult<Response> {
 pub async fn update(ctx: &mut Ctx, req: &mut Request, id: &str) -> AppResult<Response> {
     let body: UpdateSessionRequest = http::body(req).await?;
     let a = access::session(ctx, id).await?;
+    if a.row.agent() == AgentKind::Codex && (body.model.is_some() || body.effort.is_some()) {
+        return Err(conflict(
+            "Choose the Codex model and reasoning effort when starting a session",
+        ));
+    }
     a.require_owner()?;
     let title = body
         .title
@@ -895,7 +970,9 @@ pub async fn resume(ctx: &mut Ctx, req: &mut Request, id: &str) -> AppResult<Res
     refuse_review(&a.row)?;
     // As the object has it: D1's row may still say it runs after it failed
     // or stopped, while the write that says so hasn't landed.
-    if !status_now(ctx, &a.row).await.is_terminal() {
+    let status = status_now(ctx, &a.row).await;
+    let restarting_codex = status == SessionStatus::Paused && a.row.agent() == AgentKind::Codex;
+    if !status.is_terminal() && !restarting_codex {
         return Err(conflict("The session is still running"));
     }
     let user = ctx.user()?.clone();
@@ -907,7 +984,7 @@ pub async fn resume(ctx: &mut Ctx, req: &mut Request, id: &str) -> AppResult<Res
         Some(validate::message_with_files("prompt", prompt, files.len())?)
     };
     // Resumed sessions run on the resumer's subscription.
-    let credential = default_credential(ctx, &user, a.workspace_id()).await?;
+    let credential = require_connection(ctx, &user, a.workspace_id(), a.row.agent()).await?;
     let attachments = internal::claim_files(
         &ctx.env,
         &a.row.project_id,
@@ -916,6 +993,19 @@ pub async fn resume(ctx: &mut Ctx, req: &mut Request, id: &str) -> AppResult<Res
         &files,
     )
     .await?;
+    if restarting_codex {
+        let fleet = internal::fleet_stub(&ctx.env)?;
+        let _: serde_json::Value = internal::post(
+            &fleet,
+            "/stop",
+            &Stop {
+                session_id: a.row.session_id(),
+                reason: StopReason::User,
+                destroy: false,
+            },
+        )
+        .await?;
+    }
     q(
         &ctx.db,
         "UPDATE sessions SET status = 'queued', status_reason = NULL, credential_id = ?, ended_at = NULL, updated_at = ? WHERE id = ?",
@@ -936,7 +1026,8 @@ pub async fn resume(ctx: &mut Ctx, req: &mut Request, id: &str) -> AppResult<Res
             status: Some(SessionStatus::Queued),
             reason: Some("Resuming".into()),
             clear_runner: true,
-            claude_user: Some(user.to_ref()),
+            claude_user: (credential.agent == AgentKind::Claude).then(|| user.to_ref()),
+            codex_user: (credential.agent == AgentKind::Codex).then(|| user.to_ref()),
             ..Default::default()
         },
     )
@@ -970,16 +1061,17 @@ pub async fn take_over(ctx: &mut Ctx, id: &str) -> AppResult<Response> {
     refuse_review(&a.row)?;
     if a.row.is_pilot() {
         return Err(conflict(
-            "An autopilot's own session runs on its owner's Claude subscription: take the autopilot over, on its Autopilot tab, to run it on yours.",
+            "An autopilot's own session runs on its owner's subscription. Take the autopilot over on its Autopilot tab to run it on yours.",
         ));
     }
     let way = fctl_domain::claude::moving(a.row.status()).map_err(conflict)?;
     let user = ctx.user()?.clone();
-    let credential = default_credential(ctx, &user, a.workspace_id()).await?;
+    let credential = require_connection(ctx, &user, a.workspace_id(), a.row.agent()).await?;
     // One that stopped on it already (a move whose restart failed, say)
     // just starts again.
     if a.row.credential_id.as_deref() == Some(credential.id.as_str())
         && way != fctl_domain::claude::Move::Start
+        && a.row.agent() == AgentKind::Claude
     {
         return Err(conflict(
             "It runs on your Claude connection already. To move it to another of yours, choose that one for this workspace in Settings → Claude first.",
@@ -1030,7 +1122,7 @@ pub async fn move_to(
     db: &worker::D1Database,
     id: &fctl_proto::SessionId,
     way: fctl_domain::claude::Move,
-    credential: &CredentialRow,
+    credential: &SessionConnection,
     user: &UserRef,
     start: bool,
     now: i64,
@@ -1041,6 +1133,12 @@ pub async fn move_to(
         Move::Start => start,
         Move::Queued => false,
     };
+    let row = crate::spec::session_row(db, id.as_str())
+        .await?
+        .ok_or_else(|| not_found("Session"))?;
+    if row.agent() != credential.agent {
+        return Err(conflict("A session keeps the agent it started with"));
+    }
     let fleet = internal::fleet_stub(env)?;
     if way == Move::Restart {
         // Stopping first, so that messages wait for the run on the new
@@ -1067,7 +1165,8 @@ pub async fn move_to(
             &stub,
             "/control",
             &ControlState {
-                claude_user: Some(user.clone()),
+                claude_user: (credential.agent == AgentKind::Claude).then(|| user.clone()),
+                codex_user: (credential.agent == AgentKind::Codex).then(|| user.clone()),
                 keep_updated_at: true,
                 ..Default::default()
             },
@@ -1087,9 +1186,10 @@ pub async fn move_to(
         "/control",
         &ControlState {
             status: Some(SessionStatus::Queued),
-            reason: Some(format!("Continuing on {}'s Claude subscription", user.name)),
+            reason: Some(format!("Continuing on {}'s subscription", user.name)),
             clear_runner: true,
-            claude_user: Some(user.clone()),
+            claude_user: (credential.agent == AgentKind::Claude).then(|| user.clone()),
+            codex_user: (credential.agent == AgentKind::Codex).then(|| user.clone()),
             ..Default::default()
         },
     )
